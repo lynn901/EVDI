@@ -279,7 +279,7 @@ Broker 控制平面
   - **通知**：钉钉 / 企业微信 / 邮件
   - **工单**：自动创建运维工单
   - **自愈**：
-    - Broker 内置自愈规则（规则驱动，重试机制见第 11 章）
+    - Broker 内置自愈规则（规则驱动，重试机制见第 12 章）
     - 超过最大重试次数 / Fatal Error → 升级 Kagent 处置
 
 ---
@@ -3547,7 +3547,783 @@ DesktopTemplate.cpu（单台桌面不超过用户配额）
 
 ---
 
-# 15. 状态组合关系
+# 15. Monitor Service 详细设计
+
+## 15.1 服务定位
+
+Monitor Service 是 Broker 控制平面的业务监控服务，弥补 Prometheus 无法感知业务语义的不足。
+
+Monitor Service 不替代 Prometheus，而是在其之上增加业务维度的状态管理与异常检测能力。
+
+**核心职责：**
+
+- Agent 心跳管理（超时检测、状态上报）
+- Desktop State 与 K8s 实际状态一致性巡检
+- 业务维度 Prometheus metrics 暴露
+- 异常事件发布到 NATS → Event Center
+
+---
+
+## 15.2 Agent 心跳协议
+
+### 心跳上报接口
+
+Agent 定期向 Monitor Service 上报心跳：
+
+```
+POST /api/v1/agent/heartbeat
+```
+
+**Request Body：**
+
+```json
+{
+  "desktopId": "desktop_001",
+  "agentVersion": "1.0.0",
+  "uptime": 3600,
+  "ready": {
+    "agent": true,
+    "desktopService": true,
+    "captureService": true,
+    "loginReady": true
+  },
+  "system": {
+    "cpuUsagePercent": 25.5,
+    "memoryUsagePercent": 45.2,
+    "diskUsagePercent": 60.0,
+    "gpuUsagePercent": 10.0
+  },
+  "network": {
+    "clientConnected": true,
+    "bitrateKbps": 8000,
+    "packetLossRate": 0.001,
+    "latencyMs": 15
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `desktopId` | string | 桌面 ID |
+| `agentVersion` | string | Agent 版本号 |
+| `uptime` | int | Agent 运行时长（秒） |
+| `ready` | object | 四项就绪状态 |
+| `system` | object | 系统资源使用率 |
+| `network` | object | 网络质量指标 |
+
+**Response：**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "nextHeartbeatIntervalSec": 15,
+    "configVersion": "v3"
+  }
+}
+```
+
+Response 携带 Broker 侧配置，Agent 可动态调整心跳间隔和拉取最新配置版本。
+
+### 心跳频率
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| 心跳间隔 | 15 秒 | Agent 上报频率 |
+| 超时阈值 | 60 秒 | 超过 4 个心跳周期未上报视为超时 |
+| 降频间隔 | 30 秒 | 桌面处于 Stopped 状态时 Agent 降频上报（如有） |
+
+### 心跳超时处理流程
+
+```
+Agent 心跳超时（60 秒无上报）
+      ↓
+Monitor Service 更新 desktop_instances.agent_ready
+      ↓
+发布事件到 NATS: alert.desktop.heartbeat_timeout
+      ↓
+Event Center 接收事件，触发自愈链路
+      ↓
+DesktopState → Error → Recovering（详见第 12 章）
+```
+
+---
+
+## 15.3 K8s 状态一致性巡检
+
+Monitor Service 通过 K8s Watch 机制监听桌面资源状态，与 Broker 内部状态进行一致性比对。
+
+### 巡检机制
+
+```
+Monitor Service
+      ↓ Watch
+K8s API Server
+      ↓ 事件通知
+VM / Pod 状态变更事件
+      ↓
+比对 desktop_instances.desktop_state 与 K8s 实际状态
+      ↓
+      ├── 一致 → 无操作
+      └── 不一致 → 发布事件到 NATS: alert.desktop.state_inconsistency
+```
+
+### 巡检频率
+
+| 巡检项 | 频率 | 说明 |
+|--------|------|------|
+| K8s Watch 实时监听 | 持续 | VM / Pod 状态变更实时感知 |
+| 全量对账巡检 | 每 5 分钟 | 遍历所有桌面，比对 Broker 状态与 K8s 状态 |
+| Agent Ready 超时巡检 | 每 30 秒 | 检查 Initializing 状态桌面是否超时 |
+
+### 状态不一致场景
+
+| Broker 状态 | K8s 实际状态 | 处理策略 |
+|-------------|-------------|----------|
+| Starting | Pod Failed | DesktopState → Error，发布告警 |
+| Ready | Pod Terminating | DesktopState → Error，发布告警 |
+| Initializing | Pod Running 但 Agent 未上报 | 超过 5 分钟 → DesktopState → Error |
+| Stopped | Pod 仍在 Running | 发布告警，等待运维处理（不自动杀 Pod） |
+
+---
+
+## 15.4 业务 Metrics 指标体系
+
+Monitor Service 暴露 Prometheus 格式的业务指标，供 Grafana 和 Alertmanager 消费。
+
+### 指标命名规范
+
+```
+evdi_{子系统}_{指标名}_{单位}
+```
+
+### 桌面维度指标
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `evdi_desktop_total` | Gauge | 桌面总数，按 tenant/state 标签分组 |
+| `evdi_desktop_state_count` | Gauge | 各状态桌面数量 |
+| `evdi_desktop_error_total` | Counter | 进入 Error 状态的累计次数 |
+| `evdi_desktop_recovering_total` | Counter | 进入 Recovering 状态的累计次数 |
+| `evdi_desktop_recovery_success_total` | Counter | 自愈成功累计次数 |
+| `evdi_desktop_recovery_failure_total` | Counter | 自愈失败累计次数 |
+
+### Session 维度指标
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `evdi_session_active_count` | Gauge | 当前活跃 Session 数 |
+| `evdi_session_total` | Counter | Session 创建累计数 |
+| `evdi_session_connect_duration_seconds` | Histogram | Session 建连耗时分布 |
+| `evdi_session_duration_seconds` | Histogram | Session 持续时长分布 |
+| `evdi_session_disconnect_total` | Counter | Session 断线累计数 |
+
+### Agent 维度指标
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `evdi_agent_heartbeat_timeout_total` | Counter | Agent 心跳超时累计次数 |
+| `evdi_agent_ready_count` | Gauge | Agent Ready 桌面数量 |
+| `evdi_agent_version_info` | Gauge | Agent 版本分布（按 version 标签） |
+
+### 资源维度指标
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `evdi_resource_cpu_usage_ratio` | Gauge | CPU 使用率（按 tenant/pool） |
+| `evdi_resource_memory_usage_ratio` | Gauge | 内存使用率 |
+| `evdi_resource_gpu_usage_ratio` | Gauge | GPU 使用率 |
+| `evdi_resource_pool_available_count` | Gauge | 资源池可用桌面槽位数 |
+
+---
+
+## 15.5 服务内部架构
+
+```
+Monitor Service
+├── Heartbeat Manager        接收 Agent 心跳，管理超时检测
+├── K8s Watcher             Watch K8s 资源状态变更
+├── Consistency Checker     定期全量对账巡检
+├── Metrics Exporter        暴露 Prometheus metrics
+└── Event Publisher         发布异常事件到 NATS
+```
+
+Monitor Service 无状态部署，多副本通过 NATS Queue Group 竞争消费心跳数据，避免重复处理。
+
+---
+
+# 16. Event Center 详细设计
+
+## 16.1 服务定位
+
+Event Center 是 Broker 控制平面的异步告警事件处理中枢，作为 Alertmanager 的统一下游。
+
+Event Center 负责接收、路由、处置各类告警事件，驱动通知、工单、自愈和 Kagent 四条处置链路。
+
+---
+
+## 16.2 事件来源
+
+| 事件来源 | 接入方式 | 事件类型 |
+|----------|----------|----------|
+| Monitor Service | NATS `alert.desktop.*` | 心跳超时、状态不一致 |
+| Desktop Service | NATS `alert.desktop.*` | 桌面异常、资源不足 |
+| Alertmanager | HTTP Webhook | Prometheus 告警规则触发 |
+| Kagent | NATS `alert.kagent.*` | AI Agent 处置结果回报 |
+
+---
+
+## 16.3 事件模型
+
+所有事件统一为以下结构：
+
+```json
+{
+  "eventId": "evt_001",
+  "eventType": "desktop.heartbeat_timeout",
+  "severity": "Error",
+  "source": "monitor_service",
+  "resourceType": "desktop",
+  "resourceId": "desktop_001",
+  "tenantId": "tenant_abc",
+  "userId": "user_123",
+  "payload": {
+    "heartbeatTimeoutSec": 60,
+    "lastHeartbeatAt": "2024-01-01T08:00:00Z"
+  },
+  "firedAt": "2024-01-01T08:01:00Z"
+}
+```
+
+### 事件类型枚举
+
+| eventType | 严重程度 | 说明 |
+|-----------|----------|------|
+| `desktop.heartbeat_timeout` | Error | Agent 心跳超时 |
+| `desktop.crash_loop` | Error | VM / Pod CrashLoopBackOff |
+| `desktop.pvc_mount_failed` | Error | PVC 挂载失败 |
+| `desktop.state_inconsistency` | Warning | Broker 状态与 K8s 不一致 |
+| `desktop.resource_quota_exceeded` | Fatal | 资源配额不足 |
+| `desktop.storage_corrupted` | Fatal | 存储数据损坏 |
+| `session.connect_failure` | Warning | Session 建连失败 |
+| `agent.version_mismatch` | Warning | Agent 版本不兼容 |
+
+---
+
+## 16.4 告警路由规则
+
+Event Center 根据事件类型和严重程度，将事件路由到不同处置链路。
+
+### 路由配置
+
+```yaml
+routes:
+  # Fatal 级别：通知 + Kagent
+  - match:
+      severity: Fatal
+    receivers:
+      - notification
+      - kagent
+
+  # Error 级别：自愈 + 通知（超限后升级 Kagent）
+  - match:
+      severity: Error
+    receivers:
+      - self_heal
+      - notification
+
+  # Warning 级别：仅记录，不触发处置
+  - match:
+      severity: Warning
+    receivers:
+      - audit_only
+```
+
+### 处置链路说明
+
+| 处置链路 | 说明 | 是否阻塞 |
+|----------|------|----------|
+| `notification` | 发送通知到钉钉/企业微信/邮件 | 否，异步 |
+| `ticket` | 自动创建运维工单 | 否，异步 |
+| `self_heal` | Broker 内置自愈规则（详见第 12 章） | 否，异步 |
+| `kagent` | 调用 Kagent Agent 执行智能诊断与处置 | 否，异步 |
+| `audit_only` | 仅写入审计日志，不触发其他动作 | 否，异步 |
+
+---
+
+## 16.5 通知渠道配置
+
+### 钉钉机器人
+
+```yaml
+notification:
+  dingtalk:
+    enabled: true
+    webhook: "https://oapi.dingtalk.com/robot/send?access_token=xxx"
+    secret: "SECxxx"
+    atMobiles: ["13800138000"]
+    atAll: false
+```
+
+### 企业微信机器人
+
+```yaml
+notification:
+  wecom:
+    enabled: true
+    webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+    mentionedList: ["运维组"]
+```
+
+### 邮件通知
+
+```yaml
+notification:
+  email:
+    enabled: true
+    smtpHost: "smtp.example.com"
+    smtpPort: 465
+    from: "vdi-alert@example.com"
+    to: ["ops@example.com"]
+```
+
+### 通知模板
+
+```json
+{
+  "title": "【{severity}】云桌面告警：{eventType}",
+  "body": "告警事件：{eventType}\n严重程度：{severity}\n资源类型：{resourceType}\n资源 ID：{resourceId}\n租户：{tenantId}\n触发时间：{firedAt}\n详情：{payload}"
+}
+```
+
+---
+
+## 16.6 工单集成
+
+Event Center 支持对接外部工单系统，自动创建运维工单：
+
+```yaml
+ticket:
+  enabled: true
+  provider: "custom"  # custom / jira / servicenow
+  apiUrl: "https://ticket.example.com/api/v1/tickets"
+  apiToken: "${TICKET_API_TOKEN}"
+  defaultAssignee: "ops-team"
+  severityMapping:
+    Critical: "P1"
+    Error: "P2"
+    Warning: "P3"
+```
+
+工单创建后，Event Center 将工单 ID 回写到审计日志的 `extra` 字段，便于追溯。
+
+---
+
+## 16.7 自愈链路集成
+
+Event Center 与 Broker 内置自愈机制的关系：
+
+```
+Event Center 接收 Error 级别事件
+      ↓
+判断是否可自愈（参考第 12 章错误分级）
+      ├── 可自愈 → 调用 Desktop Service 自愈接口
+      │       ↓
+      │   等待自愈结果
+      │       ├── 成功 → 写入审计日志
+      │       └── 失败（超过重试次数）→ 升级到 Kagent
+      │
+      └── 不可自愈（Fatal）→ 直接升级到 Kagent
+```
+
+---
+
+## 16.8 Kagent 升级链路
+
+当内置自愈失败或遇到 Fatal 级别事件时，Event Center 调用 Kagent Agent：
+
+```
+Event Center
+      ↓ 构造告警上下文
+调用 Kagent Agent Invoke API
+      ↓
+Kagent Agent 执行诊断（调用 Broker MCP Server 工具）
+      ↓
+      ├── 可自动处置 → 执行处置动作
+      └── 需人工审批 → 触发 Human-in-the-loop
+      ↓
+处置结果回写审计日志（详见第 13 章）
+```
+
+---
+
+## 16.9 服务内部架构
+
+```
+Event Center
+├── Event Receiver         接收 NATS 事件和 Alertmanager Webhook
+├── Router                 根据路由规则分发事件
+├── Notification Sender    发送通知（钉钉/企业微信/邮件）
+├── Ticket Creator         创建工单
+├── Self-Heal Coordinator  协调自愈动作
+├── Kagent Bridge          调用 Kagent Agent API
+└── Audit Writer           写入审计日志
+```
+
+Event Center 多副本部署，通过 NATS Queue Group 竞争消费事件，保证同一事件只被处理一次。
+
+---
+
+# 17. Desktop Agent 通信协议
+
+## 17.1 协议概述
+
+Desktop Agent 运行在桌面实例（Pod/VM）内部，通过以下两个通道与外部通信：
+
+| 通道 | 方向 | 协议 | 用途 |
+|------|------|------|------|
+| Broker 通信 | Agent → Broker | HTTP REST | 心跳上报、配置拉取、状态报告 |
+| Client 通信 | Client ↔ Agent | WebRTC | 媒体流传输、DataChannel 交互 |
+
+Agent 不主动连接 K8s API，所有编排操作由 Broker 通过 K8s API 驱动。
+
+---
+
+## 17.2 Agent 注册流程
+
+Agent 启动后首先向 Broker 注册：
+
+```
+Agent 启动
+      ↓
+POST /api/v1/agent/register
+{
+  "desktopId": "desktop_001",
+  "agentVersion": "1.0.0",
+  "hostname": "desktop-001-pod",
+  "ip": "10.100.1.5",
+  "osType": "linux",
+  "gpuInfo": {
+    "vendor": "nvidia",
+    "model": "Tesla T4",
+    "driverVersion": "535.104.05"
+  }
+}
+      ↓
+Broker 记录 Agent 信息，更新 agent_ready.agent = true
+      ↓
+Agent 开始心跳上报循环
+```
+
+---
+
+## 17.3 Agent Ready 四项状态
+
+Agent 通过心跳持续上报四项就绪状态：
+
+| 字段 | 含义 | 为 true 的条件 |
+|------|------|---------------|
+| `agent` | Agent 进程本身正常 | Agent 启动成功并完成注册 |
+| `desktopService` | 桌面服务就绪 | GuestOS 启动完成、用户环境加载成功 |
+| `captureService` | 屏幕捕获服务就绪 | GStreamer 捕获 pipeline 启动成功 |
+| `loginReady` | 用户可登录 | 登录服务（如 LightDM / GDM）启动完成 |
+
+**Ready 判定条件：**
+
+```
+agent == true AND desktopService == true AND captureService == true AND loginReady == true
+→ DesktopState: Initializing → Ready
+```
+
+任一字段为 false 时，桌面保持 Initializing 状态，不对外提供服务。
+
+---
+
+## 17.4 配置下发协议
+
+Broker 通过心跳 Response 向 Agent 下发配置：
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "nextHeartbeatIntervalSec": 15,
+    "configVersion": "v3",
+    "config": {
+      "capture": {
+        "encoder": "nvenc",
+        "resolution": "1920x1080",
+        "framerate": 30,
+        "bitrateKbps": 8000
+      },
+      "webrtc": {
+        "iceServers": [
+          {
+            "urls": "stun:stun.example.com:3478"
+          }
+        ],
+        "maxBitrateKbps": 15000
+      },
+      "policy": {
+        "clipboardPolicy": "readonly",
+        "audioInputEnabled": true,
+        "audioOutputEnabled": true
+      }
+    }
+  }
+}
+```
+
+Agent 对比本地 `configVersion` 与 Response 中的版本，版本不一致时拉取新配置并应用。
+
+---
+
+## 17.5 Agent 错误上报
+
+Agent 发生异常时主动上报错误：
+
+```
+POST /api/v1/agent/error
+{
+  "desktopId": "desktop_001",
+  "errorCode": "CAPTURE_INIT_FAILED",
+  "errorMessage": "GStreamer pipeline failed to start: no GPU device found",
+  "severity": "Error",
+  "recoverable": true
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `errorCode` | 错误码枚举 |
+| `errorMessage` | 人类可读的错误描述 |
+| `severity` | Fatal / Error / Warning |
+| `recoverable` | 是否可自愈 |
+
+Broker 接收后更新桌面状态，触发对应处置链路。
+
+---
+
+## 17.6 Agent 关闭流程
+
+桌面停止时，Broker 通过 K8s API 终止 Pod / VM，Agent 感知 SIGTERM 信号后执行优雅关闭：
+
+```
+Agent 收到 SIGTERM
+      ↓
+停止接受新的 Session 连接
+      ↓
+等待当前 Session 断开（最多 10 秒）
+      ↓
+上报最后一次心跳（ready 字段全部置 false）
+      ↓
+释放 GStreamer pipeline 资源
+      ↓
+进程退出
+```
+
+---
+
+# 18. Session 质量指标体系
+
+## 18.1 指标采集架构
+
+Session 质量指标由 Agent 采集，通过心跳上报给 Monitor Service，Monitor Service 暴露为 Prometheus metrics。
+
+```
+Desktop Agent
+      ↓ 心跳上报（每 15 秒）
+Monitor Service
+      ↓ Prometheus scrape（每 15 秒）
+Prometheus
+      ↓
+Grafana Dashboard / Alertmanager
+```
+
+---
+
+## 18.2 指标定义
+
+### 视频质量指标
+
+| 指标名称 | 类型 | 单位 | 说明 |
+|----------|------|------|------|
+| `evdi_session_video_fps` | Gauge | fps | 当前视频帧率 |
+| `evdi_session_video_bitrate_kbps` | Gauge | kbps | 当前视频码率 |
+| `evdi_session_video_width` | Gauge | px | 视频分辨率宽 |
+| `evdi_session_video_height` | Gauge | px | 视频分辨率高 |
+| `evdi_session_video_encoder` | Gauge | - | 编码器类型（标签：nvenc/vaapi/x264） |
+| `evdi_session_video_keyframe_interval_sec` | Gauge | s | 关键帧间隔 |
+
+### 网络质量指标
+
+| 指标名称 | 类型 | 单位 | 说明 |
+|----------|------|------|------|
+| `evdi_session_rtt_ms` | Gauge | ms | 当前 RTT 延迟 |
+| `evdi_session_packet_loss_rate` | Gauge | ratio | 丢包率（0-1） |
+| `evdi_session_jitter_ms` | Gauge | ms | 抖动 |
+| `evdi_session_bitrate_kbps` | Gauge | kbps | 当前总码率 |
+| `evdi_session_ice_state` | Gauge | - | ICE 连接状态（标签：connected/completed/failed） |
+| `evdi_session_candidate_type` | Gauge | - | 候选类型（标签：host/srflx/relay） |
+
+### 音频质量指标
+
+| 指标名称 | 类型 | 单位 | 说明 |
+|----------|------|------|------|
+| `evdi_session_audio_bitrate_kbps` | Gauge | kbps | 音频码率 |
+| `evdi_session_audio_packet_loss_rate` | Gauge | ratio | 音频丢包率 |
+| `evdi_session_audio_level_db` | Gauge | dB | 音频电平 |
+
+### DataChannel 指标
+
+| 指标名称 | 类型 | 单位 | 说明 |
+|----------|------|------|------|
+| `evdi_session_datachannel_bytes_sent` | Counter | bytes | DataChannel 发送字节数 |
+| `evdi_session_datachannel_bytes_received` | Counter | bytes | DataChannel 接收字节数 |
+| `evdi_session_datachannel_rtt_ms` | Gauge | ms | DataChannel RTT |
+
+---
+
+## 18.3 质量告警规则
+
+| 告警名称 | 触发条件 | 严重程度 | 说明 |
+|----------|----------|----------|------|
+| `SessionHighLatency` | RTT > 200ms 持续 1 分钟 | Warning | 延迟过高 |
+| `SessionHighPacketLoss` | 丢包率 > 5% 持续 30 秒 | Warning | 丢包严重 |
+| `SessionLowFps` | 帧率 < 15fps 持续 1 分钟 | Warning | 帧率过低 |
+| `SessionIceDisconnected` | ICE 状态为 disconnected 持续 10 秒 | Error | ICE 连接断开 |
+| `SessionCandidateRelay` | 候选类型为 relay | Info | 使用 TURN 中转（性能降级） |
+
+---
+
+## 18.4 Agent 侧采集实现
+
+Agent 通过 WebRTC Stats API 采集指标：
+
+```go
+// 采集间隔：每秒采集一次，每 15 秒聚合上报一次
+stats := peerConnection.GetStats()
+for _, stat := range stats {
+    switch s := stat.(type) {
+    case *webrtc.InboundRTPStreamStats:
+        // 视频接收统计
+        fps := s.FramesPerSecond
+        bitrate := s.BytesReceived * 8 / intervalSec / 1000
+    case *webrtc.TransportStats:
+        // 网络质量统计
+        rtt := s.CurrentRoundTripTime
+        packetsLost := s.PacketsLost
+    }
+}
+```
+
+---
+
+# 19. 监控展示方案
+
+## 19.1 方案选型
+
+采用 Grafana + Prometheus 方案，不自研监控 UI。
+
+理由：
+- Grafana 成熟稳定，运维团队熟悉
+- 与 Prometheus 原生集成
+- 支持告警规则配置和通知渠道
+- 开源免费，社区活跃
+
+---
+
+## 19.2 Dashboard 规划
+
+### Dashboard 1：平台总览
+
+| 面板 | 数据源 | 说明 |
+|------|--------|------|
+| 桌面状态分布（饼图） | `evdi_desktop_state_count` | 各状态桌面数量占比 |
+| 活跃 Session 数（折线图） | `evdi_session_active_count` | 实时并发连接数趋势 |
+| 资源使用率（仪表盘） | `evdi_resource_*_usage_ratio` | CPU / 内存 / GPU 使用率 |
+| 错误桌面数（折线图） | `evdi_desktop_error_total` | 错误桌面数量趋势 |
+| 自愈成功率（仪表盘） | `evdi_desktop_recovery_*` | 自愈成功/失败比例 |
+
+### Dashboard 2：桌面运维
+
+| 面板 | 数据源 | 说明 |
+|------|--------|------|
+| Agent 心跳状态（表格） | `evdi_agent_heartbeat_timeout_total` | 超时桌面列表 |
+| Agent 版本分布（饼图） | `evdi_agent_version_info` | 各版本占比 |
+| 桌面启动耗时（直方图） | `evdi_desktop_startup_duration_seconds` | 启动耗时分布 |
+| 自愈事件时间线 | `evdi_desktop_recovery_*` | 自愈事件序列 |
+
+### Dashboard 3：Session 质量
+
+| 面板 | 数据源 | 说明 |
+|------|--------|------|
+| RTT 延迟分布（热力图） | `evdi_session_rtt_ms` | 各桌面延迟分布 |
+| 丢包率分布（热力图） | `evdi_session_packet_loss_rate` | 各桌面丢包分布 |
+| 帧率分布（直方图） | `evdi_session_video_fps` | 帧率分布 |
+| 编码器类型分布（饼图） | `evdi_session_video_encoder` | 硬编/软编占比 |
+| ICE 候选类型分布（饼图） | `evdi_session_candidate_type` | 直连/TURN 中转占比 |
+
+### Dashboard 4：资源池
+
+| 面板 | 数据源 | 说明 |
+|------|--------|------|
+| 资源池 CPU 使用率（折线图） | `evdi_resource_cpu_usage_ratio` | 按资源池分组 |
+| 资源池内存使用率（折线图） | `evdi_resource_memory_usage_ratio` | 按资源池分组 |
+| 资源池 GPU 使用率（折线图） | `evdi_resource_gpu_usage_ratio` | 按资源池分组 |
+| 可用槽位数（仪表盘） | `evdi_resource_pool_available_count` | 各资源池剩余容量 |
+
+---
+
+## 19.3 Grafana 部署
+
+Grafana 以 K8s Deployment 方式部署，持久化 Dashboard 到 ConfigMap：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: vdi-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.0.0
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: grafana-storage
+              mountPath: /var/lib/grafana
+            - name: grafana-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: grafana-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+      volumes:
+        - name: grafana-storage
+          persistentVolumeClaim:
+            claimName: grafana-pvc
+        - name: grafana-datasources
+          configMap:
+            name: grafana-datasources
+        - name: grafana-dashboards
+          configMap:
+            name: grafana-dashboards
+```
+
+---
+
+# 20. 状态组合关系
 
 Broker 内部对象模型：
 
@@ -3585,7 +4361,557 @@ Session = None
 
 ---
 
-# 16. Agent Ready 机制
+# 21. 非功能性需求
+
+## 21.1 性能目标
+
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| REST API P99 延迟 | < 200ms | 不含 K8s API 调用的接口 |
+| Session 创建 P99 延迟 | < 500ms | 含 TURN 凭证签发 |
+| WebSocket 消息推送延迟 | < 100ms | 从事件发生到客户端收到 |
+| 并发 Session 支持 | ≥ 1000 | 单集群 |
+| Agent 心跳处理吞吐 | ≥ 10000/s | 全部 Agent 心跳汇总 |
+
+---
+
+## 21.2 可用性目标
+
+| 组件 | 可用性目标 | 说明 |
+|------|-----------|------|
+| Broker REST API | 99.9%（月度） | 约 43 分钟/月不可用 |
+| WebSocket 信令通道 | 99.9% | 单副本故障不影响整体 |
+| 已建立的媒体流 | 99.99% | 数据面独立于控制面 |
+| 审计日志写入 | 99.5% | 异步写入，允许短暂丢失后补偿 |
+
+---
+
+## 21.3 容量规划
+
+### 单集群规模
+
+| 资源 | 基准值 | 说明 |
+|------|--------|------|
+| 桌面总数 | 1000 | 单集群管理上限 |
+| 并发 Session | 500 | 同时活跃连接 |
+| Agent 心跳 | 1000 × 4次/分钟 = 67/s | 15 秒间隔 |
+| 审计日志写入 | ~100 条/秒 | 高峰期 |
+
+### Broker 资源需求
+
+| 子服务 | 副本数 | CPU | 内存 | 说明 |
+|--------|--------|-----|------|------|
+| Desktop Service | 2 | 2 Core | 4 GB | 按 API QPS 扩展 |
+| Scheduler Service | 2 | 2 Core | 2 GB | 按调度并发扩展 |
+| Gateway Service | 3 | 2 Core | 4 GB | 按 WS 连接数扩展 |
+| Monitor Service | 2 | 2 Core | 2 GB | 按 Agent 数量扩展 |
+| Event Center | 2 | 1 Core | 2 GB | 按告警量扩展 |
+| Audit Service | 2 | 2 Core | 4 GB | 按写入量扩展 |
+
+### 数据库存储预估
+
+| 表 | 日增量 | 月增量 | 说明 |
+|----|--------|--------|------|
+| sessions | ~500 行 | ~15000 行 | 每次连接一条 |
+| audit_logs | ~86400 行 | ~260 万行 | 按 100 条/秒估算 |
+| desktop_instances | 变化小 | - | 稳定存量 |
+
+audit_logs 按月分区，180 天保留期，最大约 1560 万行。
+
+---
+
+## 21.4 伸缩策略
+
+| 子服务 | 扩展维度 | 扩展触发条件 |
+|--------|----------|-------------|
+| Desktop Service | API QPS | CPU > 70% 或 QPS > 500/s |
+| Scheduler Service | 调度并发 | 待处理调度队列 > 50 |
+| Gateway Service | WS 连接数 | 连接数 > 单副本 500 |
+| Monitor Service | Agent 数量 | 心跳处理延迟 > 5s |
+| Event Center | 告警量 | 事件处理队列积压 > 100 |
+| Audit Service | 写入量 | 写入队列积压 > 1000 |
+
+---
+
+# 22. 安全设计
+
+## 22.1 认证与鉴权
+
+### JWT 安全
+
+| 措施 | 说明 |
+|------|------|
+| 签名算法 | RS256（非对称加密） |
+| Access Token 有效期 | 30 分钟 |
+| Session Token 有效期 | 与 Session 生命周期绑定 |
+| Token 黑名单 | 登出时写入 Redis，TTL = Token 剩余有效期 |
+| 密钥轮换 | 支持 JWKS 端点，密钥定期轮换 |
+
+### 密码策略
+
+| 规则 | 要求 |
+|------|------|
+| 最小长度 | 8 字符 |
+| 复杂度 | 至少包含大小写字母和数字 |
+| 哈希算法 | bcrypt（cost factor = 12） |
+| 登录失败锁定 | 连续 5 次失败锁定 15 分钟 |
+
+---
+
+## 22.2 API 安全加固
+
+### 限流策略
+
+采用令牌桶算法，按租户维度限流：
+
+| 接口类型 | 限流阈值 | 说明 |
+|----------|----------|------|
+| 登录接口 | 10 次/分钟/IP | 防暴力破解 |
+| 普通 REST 接口 | 100 次/分钟/租户 | 常规操作 |
+| 批量操作接口 | 20 次/分钟/租户 | 如批量创建桌面 |
+| WebSocket 连接 | 5 次/分钟/用户 | 防连接风暴 |
+
+超限返回 HTTP 429，Response Body：
+
+```json
+{
+  "code": 1005,
+  "message": "rate limit exceeded",
+  "data": {
+    "retryAfterSec": 30
+  }
+}
+```
+
+### CORS 配置
+
+```yaml
+cors:
+  allowedOrigins:
+    - "https://vdi.example.com"
+    - "https://admin.example.com"
+  allowedMethods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+  allowedHeaders:
+    - Authorization
+    - Content-Type
+  maxAge: 3600
+```
+
+仅允许指定域名访问，不使用 `*` 通配符。
+
+### 输入校验
+
+| 校验项 | 策略 |
+|--------|------|
+| UUID 格式 | 正则校验 `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` |
+| 字符串长度 | 所有 name 字段 ≤ 128 字符 |
+| 枚举值 | state、role 等字段白名单校验 |
+| SQL 注入 | 使用参数化查询，不拼接 SQL |
+| XSS | API 层不做 HTML 转义，由客户端负责 |
+
+---
+
+## 22.3 传输安全
+
+| 措施 | 说明 |
+|------|------|
+| HTTPS | 所有 REST 接口强制 HTTPS |
+| WSS | WebSocket 信令通道强制 WSS |
+| TLS 版本 | 最低 TLS 1.2 |
+| 证书管理 | 通过 K8s cert-manager 自动签发和续期 |
+| HSTS | 响应头 `Strict-Transport-Security: max-age=31536000` |
+
+---
+
+## 22.4 审计与合规
+
+| 审计项 | 记录内容 |
+|--------|----------|
+| 登录/登出 | 用户 ID、IP、时间、clientType |
+| 桌面操作 | 操作类型、资源 ID、操作结果 |
+| 策略变更 | 变更前后值、操作人 |
+| 配额变更 | 变更前后值、操作人 |
+| Kagent 处置 | 处置动作、诊断结果、审批状态 |
+
+审计日志不可删除，保留 180 天，按月分区归档。
+
+---
+
+# 23. 可观测性设计
+
+## 23.1 日志规范
+
+### 统一日志格式
+
+所有 Broker 子服务统一使用 JSON 格式日志：
+
+```json
+{
+  "timestamp": "2024-01-01T08:00:00.123Z",
+  "level": "info",
+  "service": "desktop-service",
+  "traceId": "abc123",
+  "spanId": "def456",
+  "userId": "user_123",
+  "tenantId": "tenant_abc",
+  "method": "POST",
+  "path": "/api/v1/desktops",
+  "statusCode": 200,
+  "latencyMs": 45,
+  "message": "desktop created successfully",
+  "extra": {
+    "desktopId": "desktop_001"
+  }
+}
+```
+
+### 日志级别规范
+
+| 级别 | 使用场景 |
+|------|----------|
+| `error` | 服务不可用、数据不一致、Fatal 错误 |
+| `warn` | 可自愈错误、降级处理、性能异常 |
+| `info` | 业务操作记录、状态变更、请求处理 |
+| `debug` | 详细调试信息，生产环境默认关闭 |
+
+---
+
+## 23.2 分布式链路追踪
+
+### 追踪传播
+
+| 传播方式 | 场景 |
+|----------|------|
+| HTTP Header | REST 调用携带 `X-Trace-Id`、`X-Span-Id` |
+| NATS Header | 异步消息携带 traceId |
+| WebSocket 消息 | 信令消息 payload 携带 traceId |
+
+### 追踪采样策略
+
+| 场景 | 采样率 |
+|------|--------|
+| 正常请求 | 10% |
+| 错误请求 | 100% |
+| 慢请求（> 1s） | 100% |
+| Session 创建 | 100% |
+
+---
+
+## 23.3 Prometheus Metrics 命名规范
+
+### 命名约定
+
+```
+evdi_{子系统}_{指标名}_{单位}
+```
+
+- 子系统：`desktop`、`session`、`agent`、`resource`、`scheduler`、`gateway`、`audit`
+- 单位：`_seconds`、`_bytes`、`_ratio`、`_total`
+- 类型后缀：Counter 用 `_total`，Histogram 用 `_seconds` / `_bytes`
+
+### 标签规范
+
+| 标签名 | 说明 | 示例 |
+|--------|------|------|
+| `tenant_id` | 租户 ID | `tenant_abc` |
+| `state` | 状态 | `Ready`、`Error` |
+| `service` | 子服务名 | `desktop-service` |
+| `method` | HTTP 方法 | `GET`、`POST` |
+| `code` | HTTP 状态码 | `200`、`500` |
+
+### HTTP Metrics（所有子服务统一）
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `evdi_http_requests_total` | Counter | HTTP 请求总数 |
+| `evdi_http_request_duration_seconds` | Histogram | 请求耗时分布 |
+| `evdi_http_request_size_bytes` | Histogram | 请求体大小 |
+| `evdi_http_response_size_bytes` | Histogram | 响应体大小 |
+
+---
+
+## 23.4 告警规则汇总
+
+### 基础设施告警
+
+| 告警名称 | 触发条件 | 严重程度 |
+|----------|----------|----------|
+| `BrokerPodCrashLooping` | Pod 连续重启超过 3 次 | Critical |
+| `BrokerHighMemoryUsage` | 内存使用 > 85% 持续 5 分钟 | Warning |
+| `BrokerHighCPUUsage` | CPU 使用 > 80% 持续 5 分钟 | Warning |
+| `BrokerPostgresConnectionPoolExhausted` | 连接池使用 > 90% | Critical |
+
+### 业务告警
+
+| 告警名称 | 触发条件 | 严重程度 |
+|----------|----------|----------|
+| `DesktopFatalErrorRate` | 5 分钟内 Fatal Error 数 > 5 | Critical |
+| `SessionConnectFailureRate` | 建连失败率 > 10% 持续 5 分钟 | Warning |
+| `AgentHeartbeatTimeoutRate` | 心跳超时率 > 5% 持续 5 分钟 | Warning |
+| `AuditLogWriteLag` | 审计日志写入延迟 > 30 秒 | Warning |
+
+---
+
+# 24. 部署架构
+
+## 24.1 K8s 部署拓扑
+
+```
+K8s Cluster
+├── vdi-system Namespace（Broker 控制面）
+│   ├── Desktop Service（Deployment × 2）
+│   ├── Scheduler Service（Deployment × 2）
+│   ├── Gateway Service（Deployment × 3）
+│   ├── Monitor Service（Deployment × 2）
+│   ├── Event Center（Deployment × 2）
+│   ├── Audit Service（Deployment × 2）
+│   ├── Broker MCP Server（Deployment × 1）
+│   ├── PostgreSQL（StatefulSet × 1 主 + 1 从）
+│   ├── Redis（StatefulSet × 1 主 + 1 从）
+│   └── NATS（StatefulSet × 3）
+│
+├── vdi-monitor Namespace（监控）
+│   ├── Prometheus（StatefulSet × 1）
+│   ├── Grafana（Deployment × 1）
+│   └── Alertmanager（StatefulSet × 1）
+│
+├── vdi-tenant-{id} Namespace（每租户独立）
+│   ├── DesktopInstance（VM / Pod）
+│   ├── ResourceQuota
+│   └── NetworkPolicy
+│
+└── kagent Namespace（AI Agent）
+    ├── Kagent Controller
+    ├── VDI Ops Agent
+    └── Broker MCP Server（RemoteMCPServer CRD）
+```
+
+---
+
+## 24.2 HPA 策略
+
+Desktop Service 和 Gateway Service 配置 HPA：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: desktop-service-hpa
+  namespace: vdi-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: desktop-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: evdi_http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "500"
+```
+
+Gateway Service HPA 以 WebSocket 连接数为主要扩展指标：
+
+```yaml
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: evdi_gateway_websocket_connections
+      target:
+        type: AverageValue
+        averageValue: "500"
+```
+
+---
+
+## 24.3 PDB 配置
+
+所有 Broker 子服务配置 PodDisruptionBudget，保证滚动更新和节点维护时不中断服务：
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: desktop-service-pdb
+  namespace: vdi-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: desktop-service
+```
+
+Gateway Service 的 PDB 设置为 `minAvailable: 2`，保证至少 2 个副本在线承接 WebSocket 连接。
+
+---
+
+## 24.4 资源限制
+
+```yaml
+resources:
+  requests:
+    cpu: "2"
+    memory: "4Gi"
+  limits:
+    cpu: "4"
+    memory: "8Gi"
+```
+
+| 子服务 | requests.cpu | requests.memory | limits.cpu | limits.memory |
+|--------|-------------|-----------------|------------|---------------|
+| Desktop Service | 2 | 4Gi | 4 | 8Gi |
+| Scheduler Service | 2 | 2Gi | 4 | 4Gi |
+| Gateway Service | 2 | 4Gi | 4 | 8Gi |
+| Monitor Service | 2 | 2Gi | 4 | 4Gi |
+| Event Center | 1 | 2Gi | 2 | 4Gi |
+| Audit Service | 2 | 4Gi | 4 | 8Gi |
+
+---
+
+## 24.5 健康检查
+
+所有 Broker 子服务配置 Liveness 和 Readiness 探针：
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+`/healthz` 检查进程存活，`/readyz` 检查依赖服务（PostgreSQL、Redis、NATS）连通性。
+
+---
+
+# 25. API 版本演进与数据库 Migration
+
+## 25.1 API 版本策略
+
+### 版本号规则
+
+API 版本通过 URL 路径前缀标识：
+
+```
+/api/v1/    # 当前版本
+/api/v2/    # 下一大版本（不兼容变更）
+```
+
+### 兼容性原则
+
+| 变更类型 | 是否兼容 | 处理方式 |
+|----------|----------|----------|
+| 新增可选字段 | 兼容 | 直接添加 |
+| 新增接口 | 兼容 | 直接添加 |
+| 新增枚举值 | 兼容 | 直接添加 |
+| 删除字段 | 不兼容 | 新版本号 |
+| 修改字段类型 | 不兼容 | 新版本号 |
+| 修改字段语义 | 不兼容 | 新版本号 |
+
+### 版本共存期
+
+新版本发布后，旧版本至少保留 6 个月，期间两个版本并行运行：
+
+```
+/api/v1/desktops    → Desktop Service v1 handler
+/api/v2/desktops    → Desktop Service v2 handler
+```
+
+客户端通过 `Accept-Version` Header 或 URL 路径选择版本。
+
+---
+
+## 25.2 数据库 Migration 策略
+
+### Migration 工具
+
+使用 golang-migrate/migrate 管理 Schema 变更：
+
+```
+migrations/
+├── 000001_init_schema.up.sql
+├── 000001_init_schema.down.sql
+├── 000002_add_agent_version.up.sql
+├── 000002_add_agent_version.down.sql
+└── ...
+```
+
+### Migration 原则
+
+| 原则 | 说明 |
+|------|------|
+| 向后兼容 | 新字段必须有默认值，不影响旧版本代码 |
+| 零停机 | 使用 `ADD COLUMN` 而非 `ALTER COLUMN` |
+| 可回滚 | 每个 up.sql 对应一个 down.sql |
+| 先迁移后部署 | 先执行 Migration，再部署新版本代码 |
+
+### 安全的 Schema 变更示例
+
+```sql
+-- 安全：添加可空字段
+ALTER TABLE desktop_instances ADD COLUMN agent_version VARCHAR(32);
+
+-- 安全：添加有默认值的字段
+ALTER TABLE desktop_instances ADD COLUMN recovery_attempts INT NOT NULL DEFAULT 0;
+
+-- 危险：修改字段类型（需要新版本）
+-- 不直接 ALTER，而是：
+-- 1. 添加新字段
+-- 2. 双写新旧字段
+-- 3. 迁移历史数据
+-- 4. 切换读取到新字段
+-- 5. 删除旧字段
+```
+
+### Migration 执行流程
+
+```
+1. CI/CD 触发部署
+2. 执行 migrate up（应用新 Migration）
+3. 验证 Migration 成功
+4. 滚动更新 Broker 服务
+5. 验证新版本健康检查通过
+6. 完成部署
+```
+
+回滚流程：
+
+```
+1. 发现新版本异常
+2. 回滚 Broker 服务到上一版本
+3. 执行 migrate down（回滚 Migration）
+4. 验证回滚成功
+```
+
+---
+
+# 26. Agent Ready 机制
 
 Broker 不直接依赖 VM 或 Pod 状态判断桌面可用性。
 
@@ -3610,9 +4936,9 @@ DesktopState = Ready
 
 ---
 
-# 17. 总结
+# 27. 总结
 
-## 17.1 架构回顾
+## 27.1 架构回顾
 
 Broker 是云桌面平台的业务控制平面，由六个子服务构成：
 
@@ -3627,7 +4953,7 @@ Broker 是云桌面平台的业务控制平面，由六个子服务构成：
 
 ---
 
-## 17.2 核心设计决策汇总
+## 27.2 核心设计决策汇总
 
 | 决策项 | 选型 | 理由 |
 |--------|------|------|
@@ -3645,7 +4971,7 @@ Broker 是云桌面平台的业务控制平面，由六个子服务构成：
 
 ---
 
-## 17.3 三层状态模型
+## 27.3 三层状态模型
 
 Broker 通过三层状态模型统一管理云桌面生命周期：
 
@@ -3663,15 +4989,20 @@ UsageState      描述业务使用状态：Available / Occupied / Inactive
 
 ---
 
-## 17.4 待专项设计的模块
+## 27.4 待专项设计的模块
 
-以下模块在本文档中有所涉及，但需单独输出详细设计文档：
+以下模块在本文档中有所涉及，部分已完成详细设计，部分仍需单独输出设计文档：
 
-| 模块 | 说明 |
-|------|------|
-| Event Center | 告警路由规则、工单集成、通知渠道配置 |
-| Kagent 集成 | Agent CRD 定义、Playbook 设计、Tool Approval 配置 |
-| Monitor Service | Agent 心跳协议、业务 metrics 指标体系、巡检规则 |
-| Desktop Agent | Agent 上报协议、captureService / desktopService 启动机制 |
-| Session 质量指标 | 延迟 / 帧率 / 丢包率采集与上报方案 |
-| 监控展示方案 | Grafana Dashboard 设计或自研监控 UI 方案 |
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| Monitor Service | ✅ 已完成 | 详见第 15 章：Agent 心跳协议、业务 metrics 指标体系、巡检规则 |
+| Event Center | ✅ 已完成 | 详见第 16 章：告警路由规则、工单集成、通知渠道配置 |
+| Desktop Agent 通信协议 | ✅ 已完成 | 详见第 17 章：Agent 上报协议、心跳机制、配置下发 |
+| Session 质量指标 | ✅ 已完成 | 详见第 18 章：延迟/帧率/丢包率采集与上报方案 |
+| 监控展示方案 | ✅ 已完成 | 详见第 19 章：Grafana Dashboard 设计 |
+| 非功能性需求 | ✅ 已完成 | 详见第 21 章：性能目标、可用性目标、容量规划 |
+| 安全设计 | ✅ 已完成 | 详见第 22 章：API 限流、CORS、输入校验、密码策略 |
+| 可观测性设计 | ✅ 已完成 | 详见第 23 章：日志格式、分布式链路追踪、Prometheus metrics |
+| 部署架构 | ✅ 已完成 | 详见第 24 章：K8s 部署拓扑、HPA、PDB 配置 |
+| API 版本演进 | ✅ 已完成 | 详见第 25 章：版本兼容策略、数据库 Migration 方案 |
+| Kagent 集成 | 🔄 已有基础 | 详见第 13 章：MCP Server、Agent CRD、Human-in-the-loop |
