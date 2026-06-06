@@ -410,7 +410,7 @@ Gateway Service   → NATS → Audit Service（Session 审计）
   |                   |<-- Desktop Ready ---|               |
   |                   |-- 签发 Session Token|               |
   |                   |-- 查询 TURN 凭证    |               |
-  |<-- 200 { token, turnCredential, signalUrl }             |
+  |<-- 200 { sessionToken, signalUrl, iceServers, policy }  |
   |                   |                     |               |
   |-- WS 握手 ------->|                     |               |
   |                   |-- SUBSCRIBE ------->|               |
@@ -672,9 +672,51 @@ DesktopPolicy（桌面级覆盖策略，仅可覆盖部分字段）
 | `screenshotDisabled` | bool | 仅租户级 | 禁止截屏 |
 | `screenRecordDisabled` | bool | 仅租户级 | 禁止录屏 |
 | `watermarkEnabled` | bool | 仅租户级 | 强制水印开关 |
-| `watermarkTemplate` | string | 仅租户级 | 水印内容模板，支持 `{username}` `{datetime}` 变量 |
+| `watermarkTemplate` | string | 仅租户级 | 水印内容模板，支持 `{username}` `{datetime}` 变量（简单模式） |
+| `watermarkConfig` | object | 仅租户级 | 水印详细配置（高级模式），含字段、样式、位置，详见下方 |
 | `localDiskMapping` | bool | 桌面级可覆盖 | 本地磁盘映射开关 |
 | `dragDropTransfer` | bool | 仅租户级 | 拖拽文件传输开关 |
+
+**水印详细配置（`watermarkConfig`）**
+
+当 `watermarkEnabled = true` 时，Broker 下发 `watermarkConfig` 对象供 Client 渲染使用：
+
+```json
+{
+  "watermarkConfig": {
+    "fields": ["username", "desktop_id", "client_ip", "timestamp"],
+    "style": {
+      "mode": "tile",
+      "opacity": 0.15,
+      "angle": -30,
+      "fontSize": 14,
+      "color": "#000000",
+      "fontFamily": "sans-serif"
+    },
+    "position": {
+      "type": "corner",
+      "corner": "bottom-right",
+      "offsetX": 20,
+      "offsetY": 20
+    }
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `fields` | string[] | 展示字段：`username` / `user_id` / `desktop_id` / `client_ip` / `timestamp` |
+| `style.mode` | string | `tile`（对角线平铺）/ `corner`（固定角落） |
+| `style.opacity` | number | 透明度 0.0-1.0 |
+| `style.angle` | number | 倾斜角度（度），仅 `tile` 模式 |
+| `style.fontSize` | number | 字号（px） |
+| `style.color` | string | 文字颜色（十六进制） |
+| `style.fontFamily` | string | 字体 |
+| `position.type` | string | 位置类型 |
+| `position.corner` | string | 角落位置：`top-left` / `top-right` / `bottom-left` / `bottom-right` |
+| `position.offsetX/Y` | number | 偏移量（px） |
+
+`watermarkConfig` 优先级高于 `watermarkTemplate`。Client 优先使用 `watermarkConfig`，若未提供则回退到 `watermarkTemplate` 简单模式。
 
 ---
 
@@ -1026,7 +1068,7 @@ Client          Ingress         Broker          Media Gateway     Desktop Agent
   |                |               |-- 创建 Session (Created)            |
   |                |               |-- 签发 Session Token               |
   |                |               |-- 查询 TURN 凭证  |                 |
-  |<-- 200 { sessionToken, turnCredential, mediaGatewayUrl } ------------|
+  |<-- 200 { sessionToken, signalUrl, iceServers, policy } --------------|
   |                |               |                  |                 |
   |-- WS 握手 ws://broker/signal?token=<sessionToken> |                 |
   |                |               |-- 验证 sessionToken                |
@@ -1143,6 +1185,7 @@ wss://<broker-host>/api/v1/signal?token=<sessionToken>
 | `ice` | 媒体网关下发 ICE 候选 | `{ "candidate": "..." }` |
 | `answer` | 媒体网关回传 SDP Answer | `{ "sdp": "..." }` |
 | `heartbeat` | 保活心跳（30 秒间隔） | `{ "ts": 1234567890 }` |
+| `error` | 错误事件推送 | `{ "code": 3004, "message": "...", "level": "Fatal", "action": "RECONNECT" }` |
 
 ### 客户端上行消息类型
 
@@ -1181,26 +1224,28 @@ tenant:{tenant_id}          # 租户级广播（如维护通知）
 
 ## 9.7 TURN Server 凭证下发
 
-Broker 在创建 Session 时向 Coturn 请求时效性凭证，随 Session 创建响应一并下发给客户端：
+Broker 在创建 Session 时向 Coturn 请求时效性凭证，以 WebRTC 标准 `iceServers` 格式随 Session 创建响应一并下发给客户端：
 
 ```json
 {
-  "turnCredential": {
-    "urls": [
-      "turn:turn.example.com:3478?transport=udp",
-      "turn:turn.example.com:3478?transport=tcp",
-      "turns:turn.example.com:5349?transport=tcp"
-    ],
-    "username": "1700000000:user_123",
-    "credential": "<HMAC-SHA1 签名>",
-    "ttl": 86400
-  }
+  "iceServers": [
+    { "urls": "stun:stun.example.com:3478" },
+    {
+      "urls": [
+        "turn:turn.example.com:3478?transport=udp",
+        "turn:turn.example.com:3478?transport=tcp",
+        "turns:turn.example.com:5349?transport=tcp"
+      ],
+      "username": "1700000000:user_123",
+      "credential": "<HMAC-SHA1 签名>"
+    }
+  ]
 }
 ```
 
-`username` 格式为 `{过期时间戳}:{用户标识}`，与 Coturn 的 `use-auth-secret` 模式兼容。
+TURN `username` 格式为 `{过期时间戳}:{用户标识}`，与 Coturn 的 `use-auth-secret` 模式兼容。
 
-客户端使用该凭证自行完成 ICE Candidate Gathering，无需 Broker 代理。
+`iceServers` 可直接传给 `RTCPeerConnection` 构造函数，Client 无需额外转换或请求。客户端使用该凭证自行完成 ICE Candidate Gathering，无需 Broker 代理。
 
 ---
 
@@ -1778,20 +1823,48 @@ POST /api/v1/sessions
     "sessionId": "sess_xyz",
     "sessionToken": "<Session JWT>",
     "signalUrl": "wss://broker.example.com/api/v1/signal?token=<sessionToken>",
-    "mediaGatewayUrl": "wss://media.example.com",
-    "turnCredential": {
-      "urls": [
-        "turn:turn.example.com:3478?transport=udp",
-        "turn:turn.example.com:3478?transport=tcp",
-        "turns:turn.example.com:5349?transport=tcp"
-      ],
-      "username": "1700000000:user_123",
-      "credential": "<HMAC-SHA1>",
-      "ttl": 86400
+    "iceServers": [
+      { "urls": "stun:stun.example.com:3478" },
+      {
+        "urls": [
+          "turn:turn.example.com:3478?transport=udp",
+          "turn:turn.example.com:3478?transport=tcp",
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "username": "1700000000:user_123",
+        "credential": "<HMAC-SHA1>"
+      }
+    ],
+    "policy": {
+      "clipboardPolicy": "readonly",
+      "audioInputEnabled": true,
+      "audioOutputEnabled": true,
+      "cameraRedirection": false,
+      "printerRedirection": false,
+      "usbEnabled": false,
+      "localDiskMapping": false,
+      "watermarkEnabled": true,
+      "watermarkTemplate": "{username} {datetime}",
+      "disconnectTimeoutSec": 30,
+      "idleShutdownSec": 3600
     }
   }
 }
 ```
+
+**字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sessionId` | string | Session ID |
+| `sessionToken` | string | Session JWT，用于 WebSocket 信令鉴权 |
+| `signalUrl` | string | WebSocket 信令连接地址，Client 直接使用 |
+| `iceServers` | array | WebRTC ICE 服务器配置，可直接传给 `RTCPeerConnection` |
+| `policy` | object | 桌面生效策略，Client 据此决定功能开关 |
+
+`iceServers` 中的 TURN 凭证由 Broker 向 Coturn 请求时效性 HMAC 凭证，格式与 WebRTC 标准兼容，Client 无需额外转换。
+
+`policy` 为桌面生效策略（租户策略与桌面策略合并后），Client 在 Session 创建时即可获取，无需额外调用 `GET /api/v1/desktops/{id}/policy/effective`。
 
 若目标桌面存在活跃 Session（多设备互斥），Broker 自动踢断旧 Session 后创建新 Session。
 
@@ -2633,6 +2706,7 @@ CREATE TABLE tenant_policies (
     screen_record_disabled  BOOLEAN         NOT NULL DEFAULT TRUE,
     watermark_enabled       BOOLEAN         NOT NULL DEFAULT TRUE,
     watermark_template      VARCHAR(256)    NOT NULL DEFAULT '{username} {datetime}',
+    watermark_config        JSONB,          -- 水印详细配置（字段、样式、位置）
     local_disk_mapping      BOOLEAN         NOT NULL DEFAULT FALSE,
     drag_drop_transfer      BOOLEAN         NOT NULL DEFAULT FALSE,
 
