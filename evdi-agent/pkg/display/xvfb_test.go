@@ -8,8 +8,8 @@ import (
 
 func TestXvfbCommand(t *testing.T) {
 	cfg := &config.Config{
-		Display:    ":99",
-		VideoWidth: 1920,
+		Display:     ":99",
+		VideoWidth:  1920,
 		VideoHeight: 1080,
 	}
 	xvfb := NewXvfb(cfg)
@@ -32,13 +32,12 @@ func TestXvfbCommand(t *testing.T) {
 
 func TestXvfbScreenSpec(t *testing.T) {
 	cfg := &config.Config{
-		Display:    ":99",
-		VideoWidth: 1920,
+		Display:     ":99",
+		VideoWidth:  1920,
 		VideoHeight: 1080,
 	}
 	xvfb := NewXvfb(cfg)
 	cmd := xvfb.Command()
-	// Args[0] is program name, check for screen spec
 	found := false
 	for _, a := range cmd.Args {
 		if a == "1920x1080x24" {
