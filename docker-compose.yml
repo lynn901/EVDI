@@ -1,0 +1,20 @@
+services:
+  evdi-agent:
+    build:
+      context: ./evdi-agent
+      dockerfile: Dockerfile
+    container_name: evdi-agent-mvp
+    ports:
+      - "8080:8080"
+      - "50000-50100:50000-50100/udp"
+      - "5900:5900"
+    environment:
+      - DISPLAY=:99
+      - AGENT_WS_PORT=8080
+      - VIDEO_WIDTH=1920
+      - VIDEO_HEIGHT=1080
+      - VIDEO_FPS=30
+      - WEBRTC_PORT_MIN=50000
+      - WEBRTC_PORT_MAX=50100
+    cap_add:
+      - SYS_ADMIN
