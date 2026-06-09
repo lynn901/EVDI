@@ -416,8 +416,8 @@ Gateway Service   → NATS → Audit Service（Session 审计）
   |                   |-- SUBSCRIBE ------->|               |
   |<-- WS 建连成功    |   session:{id}      |               |
   |                   |                     |               |
-  |-- WS: offer ----->|-- 转发 → Media Gateway              |
-  |<-- WS: answer ----|<-- 转发 ← Media Gateway             |
+  |-- WS: offer ----->|-- 转发 → Agent                    |
+  |<-- WS: answer ----|<-- 转发 ← Agent                   |
   |  （ICE 协商完成）  |                     |               |
   |                   |-- REST: Session → Connected → Desktop Service
   |                   |-- PUBLISH audit → Audit Service     |
@@ -671,20 +671,20 @@ DesktopPolicy（桌面级覆盖策略，仅可覆盖部分字段）
 |------|------|----------|------|
 | `screenshotDisabled` | bool | 仅租户级 | 禁止截屏 |
 | `screenRecordDisabled` | bool | 仅租户级 | 禁止录屏 |
-| `watermarkEnabled` | bool | 仅租户级 | 强制水印开关 |
-| `watermarkTemplate` | string | 仅租户级 | 水印内容模板，支持 `{username}` `{datetime}` 变量（简单模式） |
-| `watermarkConfig` | object | 仅租户级 | 水印详细配置（高级模式），含字段、样式、位置，详见下方 |
+| `watermark` | object | 仅租户级 | 水印配置对象，包含 enabled、fields、template、style、position |
 | `localDiskMapping` | bool | 桌面级可覆盖 | 本地磁盘映射开关 |
 | `dragDropTransfer` | bool | 仅租户级 | 拖拽文件传输开关 |
 
-**水印详细配置（`watermarkConfig`）**
+**水印配置（`watermark`）**
 
-当 `watermarkEnabled = true` 时，Broker 下发 `watermarkConfig` 对象供 Client 渲染使用：
+水印配置对象包含所有水印相关设置，统一结构如下：
 
 ```json
 {
-  "watermarkConfig": {
+  "watermark": {
+    "enabled": true,
     "fields": ["username", "desktop_id", "client_ip", "timestamp"],
+    "template": "{username} {datetime}",
     "style": {
       "mode": "tile",
       "opacity": 0.15,
@@ -705,7 +705,9 @@ DesktopPolicy（桌面级覆盖策略，仅可覆盖部分字段）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `enabled` | boolean | 是否启用水印，`false` 时 Client 不执行水印渲染 |
 | `fields` | string[] | 展示字段：`username` / `user_id` / `desktop_id` / `client_ip` / `timestamp` |
+| `template` | string | 水印内容模板，支持 `{username}` `{datetime}` 变量（简单模式回退） |
 | `style.mode` | string | `tile`（对角线平铺）/ `corner`（固定角落） |
 | `style.opacity` | number | 透明度 0.0-1.0 |
 | `style.angle` | number | 倾斜角度（度），仅 `tile` 模式 |
@@ -716,7 +718,7 @@ DesktopPolicy（桌面级覆盖策略，仅可覆盖部分字段）
 | `position.corner` | string | 角落位置：`top-left` / `top-right` / `bottom-left` / `bottom-right` |
 | `position.offsetX/Y` | number | 偏移量（px） |
 
-`watermarkConfig` 优先级高于 `watermarkTemplate`。Client 优先使用 `watermarkConfig`，若未提供则回退到 `watermarkTemplate` 简单模式。
+`fields` + `style` + `position` 优先级高于 `template`。Client 优先使用详细配置，若未提供则回退到 `template` 简单模式。
 
 ---
 
@@ -1043,12 +1045,12 @@ Client
   ↓ HTTPS / WSS
 Ingress（TLS 终结 + 限流）
   ↓ HTTP / WS
-Broker（业务控制面）
-  ↓ K8s API
-Media Gateway（WebRTC 媒体面）
+Broker（业务控制面，信令编排）
+  ↓
+Agent（在桌面实例内，WebRTC 媒体面）
 ```
 
-Broker 负责信令编排，不参与媒体流传输。
+Broker 负责信令编排，媒体流在 Client 与 Agent 之间直接传输（P2P）或经 Coturn 中转。
 
 Tauri 客户端与 Web 客户端共用同一套 API，通过请求中的 `clientType` 字段区分。
 
@@ -1059,7 +1061,7 @@ Tauri 客户端与 Web 客户端共用同一套 API，通过请求中的 `client
 用户点击"连接桌面"到画面出现的全链路时序如下：
 
 ```
-Client          Ingress         Broker          Media Gateway     Desktop Agent
+Client          Ingress         Broker          Agent        （在桌面实例内）
   |                |               |                  |                 |
   |-- POST /api/v1/sessions ------>|                  |                 |
   |                |               |-- 验证 JWT        |                 |
@@ -1251,10 +1253,10 @@ TURN `username` 格式为 `{过期时间戳}:{用户标识}`，与 Coturn 的 `u
 
 ## 9.8 ICE Candidate 交换流程
 
-客户端完成 ICE Gathering 后，通过 WebSocket 信令通道与媒体网关交换候选：
+客户端完成 ICE Gathering 后，通过 WebSocket 信令通道与 Agent（在桌面实例内）交换候选：
 
 ```
-Client                  Broker                  Media Gateway
+Client                  Broker                     Agent
   |                       |                           |
   |-- WS: offer { sdp }-->|-- 转发 offer ------------>|
   |                       |<-- answer { sdp } --------|
@@ -1843,10 +1845,13 @@ POST /api/v1/sessions
       "printerRedirection": false,
       "usbEnabled": false,
       "localDiskMapping": false,
-      "watermarkEnabled": true,
-      "watermarkTemplate": "{username} {datetime}",
-      "disconnectTimeoutSec": 30,
-      "idleShutdownSec": 3600
+      "watermark": {
+        "enabled": true,
+        "fields": ["username", "desktop_id"],
+        "template": "{username} {datetime}",
+        "disconnectTimeoutSec": 30,
+        "idleShutdownSec": 3600
+      }
     }
   }
 }
@@ -2185,8 +2190,10 @@ POST /api/v1/tenants/{tenantId}/policy
   "maxSessionDurationSec": 0,
   "screenshotDisabled": true,
   "screenRecordDisabled": true,
-  "watermarkEnabled": true,
-  "watermarkTemplate": "{username} {datetime}",
+  "watermark": {
+    "enabled": true,
+    "template": "{username} {datetime}"
+  },
   "localDiskMapping": false,
   "dragDropTransfer": false
 }

@@ -456,37 +456,88 @@ func (e *WebRTCEngine) CreateDataChannel() error {
 | 剪贴板 | reliable, ordered | 数据不能丢失，丢失会导致内容不完整 |
 | 心跳 | unreliable | 丢一两个没关系，保持连接活跃即可 |
 
-**消息路由：**
+**DataChannel 消息格式（与 Client 一致）：**
+
+所有 DataChannel 消息均采用统一 JSON 帧结构：
+
+```json
+{
+  "v": 1,
+  "type": "input.mouse_move",
+  "ts": 1700000000123,
+  "seq": 1024,
+  "payload": { "x": 960, "y": 540, "display_id": 0 }
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `v` | number | 是 | 协议版本号，当前为 `1` |
+| `type` | string | 是 | 消息类型，见消息类型总览 |
+| `ts` | number | 是 | 客户端发送时间戳（Unix 毫秒），用于端到端延迟统计 |
+| `seq` | number | 是 | 单调递增序列号，每条通道独立计数，用于乱序检测与日志追踪 |
+| `payload` | object | 是 | 消息体，结构因 `type` 而异 |
+
+**支持的 `type` 值（完整定义见 Client 文档 §7.3）：**
+
+| `type` 值 | 通道 | 方向 | 说明 |
+|-----------|------|------|------|
+| `input.mouse_move` | control | Client → Desktop | 鼠标移动 |
+| `input.mouse_button` | control | Client → Desktop | 鼠标按键按下/释放 |
+| `input.mouse_wheel` | control | Client → Desktop | 滚轮事件 |
+| `input.key` | control | Client → Desktop | 键盘按键按下/释放 |
+| `clipboard.push` | bulk | Client ↔ Desktop | 推送剪贴板内容（双向） |
+| `clipboard.request` | bulk | Client → Desktop | 请求桌面当前剪贴板内容 |
+| `ctrl.ping` | control | Client → Desktop | 心跳探测 |
+| `ctrl.pong` | control | Desktop → Client | 心跳响应 |
+| `ctrl.resize` | control | Client → Desktop | 通知桌面调整分辨率 |
+
+**Go 代码实现：**
 
 ```go
-// 消息类型定义
-type MessageType uint8
-
-const (
-    MessageTypeKeyboard   MessageType = 0x01
-    MessageTypeMouse      MessageType = 0x02
-    MessageTypeClipboard  MessageType = 0x03
-    MessageTypeHeartbeat  MessageType = 0x04
-)
-
-// 消息结构
+// DataChannel 消息结构（JSON 统一格式）
 type ControlMessage struct {
-    Type    MessageType
-    Payload []byte
+    V       int                    `json:"v"`
+    Type    string                 `json:"type"`
+    Ts      int64                  `json:"ts"`
+    Seq     int                    `json:"seq"`
+    Payload map[string]interface{} `json:"payload"`
 }
 
 // 消息路由
-func (e *WebRTCEngine) handleMessage(msg ControlMessage) {
-    switch msg.Type {
-    case MessageTypeKeyboard:
-        e.handleKeyboardEvent(msg.Payload)
-    case MessageTypeMouse:
-        e.handleMouseEvent(msg.Payload)
-    case MessageTypeClipboard:
-        e.handleClipboardEvent(msg.Payload)
-    case MessageTypeHeartbeat:
-        e.handleHeartbeat(msg.Payload)
+func (e *WebRTCEngine) handleMessage(jsonMsg string) error {
+    var msg ControlMessage
+    if err := json.Unmarshal([]byte(jsonMsg), &msg); err != nil {
+        return fmt.Errorf("invalid message format: %w", err)
     }
+
+    // 版本检查
+    if msg.V != 1 {
+        return fmt.Errorf("unsupported protocol version: %d", msg.V)
+    }
+
+    // 根据 type 字段路由消息
+    switch msg.Type {
+    case "input.mouse_move":
+        e.handleMouseMove(msg.Payload)
+    case "input.mouse_button":
+        e.handleMouseButton(msg.Payload)
+    case "input.mouse_wheel":
+        e.handleMouseWheel(msg.Payload)
+    case "input.key":
+        e.handleKeyboardEvent(msg.Payload)
+    case "clipboard.push":
+        e.handleClipboardPush(msg.Payload)
+    case "clipboard.request":
+        e.handleClipboardRequest(msg.Payload)
+    case "ctrl.ping":
+        e.handlePing(msg.Payload)
+    case "ctrl.resize":
+        e.handleResize(msg.Payload)
+    default:
+        return fmt.Errorf("unknown message type: %s", msg.Type)
+    }
+    return nil
 }
 ```
 
@@ -8022,80 +8073,99 @@ Ctrl+C:
 
 #### 4.2.13 消息处理代码
 
-**消息解析：**
+**Go 代码实现：**
 
 ```go
-// 消息头
-type MessageHeader struct {
-    Version   uint8
-    Type      uint8
-    Reserved  uint16
-    Timestamp uint32
+// DataChannel 消息结构（JSON 统一格式）
+type ControlMessage struct {
+    V       int                    `json:"v"`
+    Type    string                 `json:"type"`
+    Ts      int64                  `json:"ts"`
+    Seq     int                    `json:"seq"`
+    Payload map[string]interface{} `json:"payload"`
 }
 
-// 解析消息头
-func parseMessageHeader(data []byte) (*MessageHeader, error) {
-    if len(data) < 8 {
-        return nil, fmt.Errorf("message too short")
+// 消息路由与处理
+func (e *WebRTCEngine) handleMessage(channel string, jsonData []byte) error {
+    var msg ControlMessage
+    if err := json.Unmarshal(jsonData, &msg); err != nil {
+        return fmt.Errorf("invalid message format: %w", err)
     }
 
-    return &MessageHeader{
-        Version:   data[0],
-        Type:      data[1],
-        Reserved:  binary.BigEndian.Uint16(data[2:4]),
-        Timestamp: binary.BigEndian.Uint32(data[4:8]),
-    }, nil
+    // 版本检查
+    if msg.V != 1 {
+        return fmt.Errorf("unsupported protocol version: %d", msg.V)
+    }
+
+    // 根据通道和消息类型路由
+    if channel == "control" {
+        return e.handleControlMessage(msg)
+    } else if channel == "bulk" {
+        return e.handleBulkMessage(msg)
+    }
+    return fmt.Errorf("unknown channel: %s", channel)
 }
 
-// 消息路由
-func (e *WebRTCEngine) handleMessage(channel string, data []byte) error {
-    header, err := parseMessageHeader(data)
-    if err != nil {
-        return err
-    }
-
-    switch header.Type {
-    case MessageTypeKeyDown:
-        return e.handleKeyDown(data)
-    case MessageTypeKeyUp:
-        return e.handleKeyUp(data)
-    case MessageTypeMouseMove:
-        return e.handleMouseMove(data)
-    case MessageTypeMouseDown:
-        return e.handleMouseDown(data)
-    case MessageTypeMouseUp:
-        return e.handleMouseUp(data)
-    case MessageTypeMouseScroll:
-        return e.handleMouseScroll(data)
-    case MessageTypeTouchStart:
-        return e.handleTouchStart(data)
-    case MessageTypeTouchMove:
-        return e.handleTouchMove(data)
-    case MessageTypeTouchEnd:
-        return e.handleTouchEnd(data)
-    case MessageTypeGesturePinch:
-        return e.handleGesturePinch(data)
-    case MessageTypeGestureSwipe:
-        return e.handleGestureSwipe(data)
-    case MessageTypeGestureRotate:
-        return e.handleGestureRotate(data)
-    case MessageTypeSystemCommand:
-        return e.handleSystemCommand(data)
-    case MessageTypeClipboardUpdate:
-        return e.handleClipboardUpdate(data)
-    case MessageTypeClipboardRequest:
-        return e.handleClipboardRequest(data)
-    case MessageTypeHeartbeat:
-        return e.handleHeartbeat(data)
-    case MessageTypeMediaControl:
-        return e.handleMediaControl(data)
+// 控制通道消息处理
+func (e *WebRTCEngine) handleControlMessage(msg ControlMessage) error {
+    switch msg.Type {
+    case "input.mouse_move":
+        return e.handleMouseMove(msg.Payload)
+    case "input.mouse_button":
+        return e.handleMouseButton(msg.Payload)
+    case "input.mouse_wheel":
+        return e.handleMouseWheel(msg.Payload)
+    case "input.key":
+        return e.handleKeyboardEvent(msg.Payload)
+    case "ctrl.ping":
+        return e.handlePing(msg.Payload)
+    case "ctrl.resize":
+        return e.handleResize(msg.Payload)
     default:
-        return fmt.Errorf("unknown message type: %d", header.Type)
+        return fmt.Errorf("unknown control message type: %s", msg.Type)
+    }
+}
+
+// 大数据通道消息处理
+func (e *WebRTCEngine) handleBulkMessage(msg ControlMessage) error {
+    switch msg.Type {
+    case "clipboard.push":
+        return e.handleClipboardPush(msg.Payload)
+    case "clipboard.request":
+        return e.handleClipboardRequest(msg.Payload)
+    default:
+        return fmt.Errorf("unknown bulk message type: %s", msg.Type)
     }
 }
 ```
 
-**键盘事件处理：**
+**消息发送辅助函数：**
+
+```go
+// 构造并 JSON 序列化消息
+func buildMessage(msgType string, ts int64, seq int, payload map[string]interface{}) ([]byte, error) {
+    msg := ControlMessage{
+        V:       1,
+        Type:    msgType,
+        Ts:      ts,
+        Seq:     seq,
+        Payload: payload,
+    }
+    return json.Marshal(msg)
+}
+
+// 发送控制消息
+func (e *WebRTCEngine) sendControlMessage(msgType string, payload map[string]interface{}, channelName string) error {
+    ts := time.Now().UnixNano() / int64(time.Millisecond)
+    msgData, err := buildMessage(msgType, ts, e.sequenceNumber(channelName), payload)
+    if err != nil {
+        return err
+    }
+    return e.dataChannel[channelName].Send(msgData)
+}
+```
+
+**键盘事件处理示例：**
 
 ```go
 // 处理键盘按下事件
@@ -8380,9 +8450,9 @@ func (e *WebRTCEngine) sendCommandResponse(commandID uint32, success bool) error
 **未知消息处理：**
 
 ```go
-// 处理未知消息类型
-func (e *WebRTCEngine) handleUnknownMessage(header *MessageHeader, data []byte) {
-    log.Printf("Unknown message type: %d, version: %d", header.Type, header.Version)
+// 处理未知消息类型（JSON 格式）
+func (e *WebRTCEngine) handleUnknownMessage(msg ControlMessage) {
+    log.Printf("Unknown message type: %s, version: %d, seq: %d", msg.Type, msg.V, msg.Seq)
     
     // 忽略未知消息，不报错
     // 这保证了向后兼容性
@@ -8439,237 +8509,103 @@ func fromJSON(data []byte, v interface{}) error {
 }
 ```
 
-#### 4.3.5 二进制序列化规范
+#### 4.3.5 JSON 序列化工具函数
 
-**DataChannel 二进制规范：**
+**注意**：本协议统一使用 JSON 格式，不再使用二进制序列化。
 
-| 规范项 | 定义 |
-|--------|------|
-| 字节序 | Big-Endian（大端序） |
-| 对齐 | 无对齐要求 |
-| 字符串 | UTF-8 编码，4 字节长度前缀 |
-| 数组 | 4 字节长度前缀 |
-| 嵌套消息 | 4 字节长度前缀 |
-
-**二进制编码示例：**
+**消息序列化辅助函数：**
 
 ```go
-// 编码 uint16
-func encodeUint16(value uint16) []byte {
-    data := make([]byte, 2)
-    binary.BigEndian.PutUint16(data, value)
-    return data
+// 使用标准库 json 进行序列化
+func serialize(msg ControlMessage) ([]byte, error) {
+    return json.Marshal(msg)
 }
 
-// 编码 uint32
-func encodeUint32(value uint32) []byte {
-    data := make([]byte, 4)
-    binary.BigEndian.PutUint32(data, value)
-    return data
+// 使用标准库 json 进行反序列化
+func deserialize(data []byte, msg *ControlMessage) error {
+    return json.Unmarshal(data, msg)
 }
 
-// 编码字符串
-func encodeString(s string) []byte {
-    bytes := []byte(s)
-    length := encodeUint32(uint32(len(bytes)))
-    return append(length, bytes...)
+// payload 字段提取辅助函数
+func getIntPayload(payload map[string]interface{}, key string, defaultValue int) int {
+    if val, ok := payload[key]; ok {
+        if num, ok := val.(float64); ok {
+            return int(num)
+        }
+    }
+    return defaultValue
 }
 
-// 解码 uint16
-func decodeUint16(data []byte) uint16 {
-    return binary.BigEndian.Uint16(data)
+func getStringPayload(payload map[string]interface{}, key string, defaultValue string) string {
+    if val, ok := payload[key]; ok {
+        if str, ok := val.(string); ok {
+            return str
+        }
+    }
+    return defaultValue
 }
 
-// 解码 uint32
-func decodeUint32(data []byte) uint32 {
-    return binary.BigEndian.Uint32(data)
-}
-
-// 解码字符串
-func decodeString(data []byte) (string, int) {
-    length := decodeUint32(data[:4])
-    s := string(data[4 : 4+length])
-    return s, 4 + int(length)
+func getBoolPayload(payload map[string]interface{}, key string, defaultValue bool) bool {
+    if val, ok := payload[key]; ok {
+        if b, ok := val.(bool); ok {
+            return b
+        }
+    }
+    return defaultValue
 }
 ```
 
-#### 4.3.6 序列化工具函数
-
-**消息编码器：**
+**消息发送示例：**
 
 ```go
-type MessageEncoder struct {
-    buffer []byte
-}
-
-// 创建编码器
-func NewMessageEncoder() *MessageEncoder {
-    return &MessageEncoder{
-        buffer: make([]byte, 0),
+// 发送鼠标移动消息
+func (e *WebRTCEngine) sendMouseMove(x, y int, displayID int) error {
+    payload := map[string]interface{}{
+        "x":          x,
+        "y":          y,
+        "display_id": displayID,
     }
+    return e.sendControlMessage("input.mouse_move", payload, "control")
 }
 
-// 写入消息头
-func (e *MessageEncoder) WriteHeader(version, msgType uint8, timestamp uint32) {
-    e.buffer = append(e.buffer, version)
-    e.buffer = append(e.buffer, msgType)
-    e.buffer = append(e.buffer, 0, 0) // Reserved
-    e.buffer = append(e.buffer, encodeUint32(timestamp)...)
+// 发送键盘按键消息
+func (e *WebRTCEngine) sendKey(code string, action string, modifiers []string) error {
+    payload := map[string]interface{}{
+        "code":      code,
+        "action":    action,
+        "modifiers": modifiers,
+    }
+    return e.sendControlMessage("input.key", payload, "control")
 }
 
-// 写入 uint8
-func (e *MessageEncoder) WriteUint8(value uint8) {
-    e.buffer = append(e.buffer, value)
-}
-
-// 写入 uint16
-func (e *MessageEncoder) WriteUint16(value uint16) {
-    e.buffer = append(e.buffer, encodeUint16(value)...)
-}
-
-// 写入 uint32
-func (e *MessageEncoder) WriteUint32(value uint32) {
-    e.buffer = append(e.buffer, encodeUint32(value)...)
-}
-
-// 写入 int32
-func (e *MessageEncoder) WriteInt32(value int32) {
-    e.buffer = append(e.buffer, encodeUint32(uint32(value))...)
-}
-
-// 写入 float32
-func (e *MessageEncoder) WriteFloat32(value float32) {
-    bits := math.Float32bits(value)
-    e.buffer = append(e.buffer, encodeUint32(bits)...)
-}
-
-// 写入字符串
-func (e *MessageEncoder) WriteString(s string) {
-    e.buffer = append(e.buffer, encodeString(s)...)
-}
-
-// 写入字节数组
-func (e *MessageEncoder) WriteBytes(data []byte) {
-    length := encodeUint32(uint32(len(data)))
-    e.buffer = append(e.buffer, length...)
-    e.buffer = append(e.buffer, data...)
-}
-
-// 获取编码结果
-func (e *MessageEncoder) Bytes() []byte {
-    return e.buffer
+// 发送剪贴板推送消息
+func (e *WebRTCEngine) sendClipboard(formats []string, data map[string]string) error {
+    payload := map[string]interface{}{
+        "formats": formats,
+        "data":    data,
+    }
+    return e.sendControlMessage("clipboard.push", payload, "bulk")
 }
 ```
 
-**消息解码器：**
+#### 4.3.6 JSON 序列化优势说明
+
+| 特性 | JSON | 二进制 |
+|------|------|--------|
+| 可读性 | ✅ 易于调试 | ❌ 需要工具解析 |
+| 扩展性 | ✅ 新字段自动忽略 | ❌ 需要协议更新 |
+| 字符串 | ✅ Unicode 原生支持 | ❌ 需要长度前缀 |
+| 嵌套结构 | ✅ 原生支持 | ❌ 需要手动序列化 |
+| 网络带宽 | ⚠️ 较大 | ✅ 更小 |
+| 解析速度 | ⚠️ 慢 10-20% | ✅ 更快 |
+
+**采用 JSON 的理由：**
+1. **可调试性强**：远程桌面场景需要快速定位网络层输入异常
+2. **版本兼容性**：`v` 版本字段允许协议演进，新字段可默认忽略
+3. **开发效率高**：前端和后端使用相同的 JSON 结构
+4. **性能可接受**：控制消息流量小，JSON 额外开销影响可忽略
 
 ```go
-type MessageDecoder struct {
-    data   []byte
-    offset int
-}
-
-// 创建解码器
-func NewMessageDecoder(data []byte) *MessageDecoder {
-    return &MessageDecoder{
-        data:   data,
-        offset: 0,
-    }
-}
-
-// 读取消息头
-func (d *MessageDecoder) ReadHeader() (*MessageHeader, error) {
-    if d.offset+8 > len(d.data) {
-        return nil, fmt.Errorf("not enough data for header")
-    }
-
-    header := &MessageHeader{
-        Version:   d.data[d.offset],
-        Type:      d.data[d.offset+1],
-        Reserved:  binary.BigEndian.Uint16(d.data[d.offset+2 : d.offset+4]),
-        Timestamp: binary.BigEndian.Uint32(d.data[d.offset+4 : d.offset+8]),
-    }
-    d.offset += 8
-    return header, nil
-}
-
-// 读取 uint8
-func (d *MessageDecoder) ReadUint8() (uint8, error) {
-    if d.offset+1 > len(d.data) {
-        return 0, fmt.Errorf("not enough data")
-    }
-    value := d.data[d.offset]
-    d.offset++
-    return value, nil
-}
-
-// 读取 uint16
-func (d *MessageDecoder) ReadUint16() (uint16, error) {
-    if d.offset+2 > len(d.data) {
-        return 0, fmt.Errorf("not enough data")
-    }
-    value := binary.BigEndian.Uint16(d.data[d.offset : d.offset+2])
-    d.offset += 2
-    return value, nil
-}
-
-// 读取 uint32
-func (d *MessageDecoder) ReadUint32() (uint32, error) {
-    if d.offset+4 > len(d.data) {
-        return 0, fmt.Errorf("not enough data")
-    }
-    value := binary.BigEndian.Uint32(d.data[d.offset : d.offset+4])
-    d.offset += 4
-    return value, nil
-}
-
-// 读取 int32
-func (d *MessageDecoder) ReadInt32() (int32, error) {
-    value, err := d.ReadUint32()
-    return int32(value), err
-}
-
-// 读取 float32
-func (d *MessageDecoder) ReadFloat32() (float32, error) {
-    bits, err := d.ReadUint32()
-    if err != nil {
-        return 0, err
-    }
-    return math.Float32frombits(bits), nil
-}
-
-// 读取字符串
-func (d *MessageDecoder) ReadString() (string, error) {
-    length, err := d.ReadUint32()
-    if err != nil {
-        return "", err
-    }
-    if d.offset+int(length) > len(d.data) {
-        return "", fmt.Errorf("not enough data for string")
-    }
-    s := string(d.data[d.offset : d.offset+int(length)])
-    d.offset += int(length)
-    return s, nil
-}
-
-// 读取字节数组
-func (d *MessageDecoder) ReadBytes() ([]byte, error) {
-    length, err := d.ReadUint32()
-    if err != nil {
-        return nil, err
-    }
-    if d.offset+int(length) > len(d.data) {
-        return nil, fmt.Errorf("not enough data for bytes")
-    }
-    data := d.data[d.offset : d.offset+int(length)]
-    d.offset += int(length)
-    return data, nil
-}
-```
-
-#### 4.3.7 消息完整性校验
-
-**CRC32 校验：**
 
 ```
 消息格式（带校验）：
@@ -8749,31 +8685,30 @@ func validatePressure(pressure float32) bool {
 **类型检查：**
 
 ```go
-// 验证消息类型
-func validateMessageType(msgType uint8) bool {
-    validTypes := map[uint8]bool{
-        MessageTypeKeyDown:       true,
-        MessageTypeKeyUp:         true,
-        MessageTypeMouseMove:     true,
-        MessageTypeMouseDown:     true,
-        MessageTypeMouseUp:       true,
-        MessageTypeMouseScroll:   true,
-        MessageTypeTouchStart:    true,
-        MessageTypeTouchMove:     true,
-        MessageTypeTouchEnd:      true,
-        MessageTypeGesturePinch:  true,
-        MessageTypeGestureSwipe:  true,
-        MessageTypeGestureRotate: true,
-        MessageTypeSystemCommand: true,
-        MessageTypeCommandResult: true,
-        MessageTypeClipboardUpdate: true,
-        MessageTypeClipboardRequest: true,
-        MessageTypeHeartbeat:     true,
-        MessageTypeHeartbeatAck:  true,
-        MessageTypeMediaControl:  true,
-        MessageTypeMediaState:    true,
+// 验证消息类型（JSON 字符串匹配）
+func validateMessageType(msgType string) bool {
+    // 动态消息类型字符串（遵循 Client 文档 §7.3 定义）
+    validTypes := map[string]bool{
+        // 输入事件类型
+        "input.mouse_move":   true,
+        "input.mouse_button": true,
+        "input.mouse_wheel":  true,
+        "input.key":          true,
+        "input.touch":        true,
+        // 剪贴板类型
+        "clipboard.push":     true,
+        "clipboard.request":  true,
+        // 控制类型
+        "ctrl.ping":          true,
+        "ctrl.pong":          true,
+        "ctrl.resize":        true,
     }
-    return validTypes[msgType]
+    if _, ok := validTypes[msgType]; ok {
+        return true
+    }
+    // 未知类型记录日志但不拒绝（支持向后兼容）
+    log.Printf("Unknown message type: %s", msgType)
+    return true
 }
 ```
 
@@ -8832,14 +8767,15 @@ func (d *MessageDeduplicator) cleanup() {
 deduplicator := NewMessageDeduplicator(5 * time.Minute)
 
 // 处理消息
-func (e *WebRTCEngine) handleMessageWithDedup(data []byte) error {
-    // 提取消息 ID（使用时间戳作为消息 ID）
-    header, err := parseMessageHeader(data)
-    if err != nil {
+func (e *WebRTCEngine) handleMessageWithDedup(jsonData []byte) error {
+    // 反序列化 JSON 消息
+    var msg ControlMessage
+    if err := json.Unmarshal(jsonData, &msg); err != nil {
         return err
     }
     
-    messageID := fmt.Sprintf("%d_%d", header.Type, header.Timestamp)
+    // 提取消息 ID（使用类型 + 序列号作为消息 ID）
+    messageID := fmt.Sprintf("%s_%d", msg.Type, msg.Seq)
     
     // 检查是否重复
     if deduplicator.IsDuplicate(messageID) {
@@ -8848,7 +8784,7 @@ func (e *WebRTCEngine) handleMessageWithDedup(data []byte) error {
     }
     
     // 处理消息
-    return e.handleMessage(data)
+    return e.handleMessage(jsonData)
 }
 ```
 

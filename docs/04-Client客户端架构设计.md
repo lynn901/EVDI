@@ -44,7 +44,7 @@
 - 移动端（Android / iOS）客户端设计，详见后续移动端专项设计文档
 - 盲水印（DWT-DCT 频域嵌入）实现，详见后续水印专项设计文档
 - Broker 控制平面设计，详见《云桌面 Broker 控制平面架构设计》
-- 媒体网关（Media Gateway）设计
+- Agent 媒体引擎设计（详见《Agent 架构设计》）
 - 服务端部署与运维
 
 ---
@@ -120,12 +120,12 @@ Client（Web / Native）
         ↓ HTTPS / WSS
     Ingress（TLS 终结 + 限流）
         ↓
-    Broker Gateway Service（信令编排、Token 校验）
+    Broker Gateway Service（信令编排、Token 校验、SDP/ICE 中转）
         ↓ ICE 协商完成后
-    Media Gateway（WebRTC 媒体流，P2P 或 TURN 中转）
+    Agent（WebRTC 媒体流，P2P 或经 Coturn 中转）
 ```
 
-Broker 负责信令编排，媒体流不经过 Broker，Client 直接与 Media Gateway 建立 WebRTC 连接。
+Broker 负责信令编排，媒体流在 Client 与 Agent 之间直接传输（P2P）或经 Coturn 中转。
 
 **交付优先级：** Web 客户端优先交付，Windows Native 客户端次之，移动端后续单独规划。
 
@@ -151,7 +151,7 @@ Broker 负责信令编排，媒体流不经过 Broker，Client 直接与 Media G
 WebRTC 视频流采用双层渲染架构：
 
 ```
-Media Gateway
+Agent（在桌面实例内）
     ↓ WebRTC H.264 视频流
 <video> 元素（负责硬件解码，不显示）
     ↓ 每帧 drawImage()
@@ -500,19 +500,19 @@ Broker 通过 WebSocket 推送强制下线事件，Client 收到后立即执行�
 
 ```
 阶段一：会话创建（Client ↔ Broker REST）
-阶段二：ICE 协商（Client ↔ Broker WebSocket ↔ Media Gateway）
-阶段三：媒体建流（Client ↔ Media Gateway，P2P 或 TURN 中转）
+阶段二：ICE 协商（Client ↔ Broker WebSocket ↔ Agent）
+阶段三：媒体建流（Client ↔ Agent，P2P 或经 Coturn 中转）
 ```
 
 完整时序：
 
 ```
-Client                        Broker                    Media Gateway
+Client                        Broker                      Agent
   |                              |                            |
   |-- POST /api/v1/sessions ---->|                            |
   |   （请求创建桌面会话）         |                            |
   |                              |-- 分配桌面实例               |
-  |                              |-- 启动 Media Gateway        |
+  |-- Agent 位于桌面实例内 -----|                            |
   |                              |-- 签发 Session Token        |
   |<-- 200 {                     |                            |
   |     sessionToken,            |                            |
@@ -532,7 +532,7 @@ Client                        Broker                    Media Gateway
   |-- ICE Candidate（via WS）--->|-- 转发 Candidate ---------->|
   |<-- ICE Candidate（via WS）---|<-- 转发 Candidate ----------|
   |                              |                            |
-  |========= WebRTC PeerConnection 建立完成 =================>|
+  |========= WebRTC PeerConnection 建立完成 ==================>|
   |<========= 视频流 + 音频流 + DataChannel ==================|
 ```
 
@@ -542,7 +542,7 @@ Client                        Broker                    Media Gateway
 
 **ICE 协商通道**
 
-ICE Candidate 交换复用 Broker WebSocket 信令通道，不建立独立连接。WebSocket 连接建立后，Client 与 Media Gateway 通过 Broker 中转完成 SDP 和 Candidate 交换，PeerConnection 建立后媒体流直接在 Client 与 Media Gateway 之间传输，不再经过 Broker。
+ICE Candidate 交换复用 Broker WebSocket 信令通道，Broker 在 Client 与 Agent 之间转发 SDP 和 Candidate。PeerConnection 建立后媒体流直接在 Client 与 Agent 之间传输（P2P）或经 Coturn 中转，不经过 Broker。
 
 **ICE 服务器配置**
 
@@ -573,7 +573,7 @@ Client 发起 SDP Offer 时，各媒体轨道方向如下：
 | DataChannel `control` | — | Client 发起创建，label 为 `control`（全小写） |
 | DataChannel `bulk` | — | Client 发起创建，label 为 `bulk`（全小写） |
 
-DataChannel 由 Client 在创建 Offer 时主动发起，Media Gateway 在 Answer 中确认。
+DataChannel 由 Client 在创建 Offer 时主动发起，Agent 在 Answer 中确认。
 
 **连接失败降级策略**
 
@@ -631,8 +631,8 @@ Session Token 通过 URL Query 参数传递，不使用 `Authorization` Header�
 | `session_state` | Session 状态变更 | `{ "state": "Connected" \| "Disconnected" \| "Closed" }` |
 | `desktop_state` | Desktop 状态变更 | `{ "state": "Ready" \| "Error" \| "Recovering" }` |
 | `session_replaced` | 被其他设备踢下线 | `{ "reason": "LOGIN_FROM_OTHER_DEVICE" }` |
-| `ice` | Media Gateway 下发 ICE Candidate | `{ "candidate": "..." }` |
-| `answer` | Media Gateway 回传 SDP Answer | `{ "sdp": "..." }` |
+| `ice` | Agent 下发 ICE Candidate（经 Broker 转发） | `{ "candidate": "..." }` |
+| `answer` | Agent 回传 SDP Answer（经 Broker 转发） | `{ "sdp": "..." }` |
 | `heartbeat` | Broker 保活心跳（30 秒间隔） | `{ "ts": 1234567890 }` |
 | `error` | 错误事件 | `{ "code": 3004, "message": "...", "level": "Fatal", "action": "RECONNECT" }` |
 
@@ -647,7 +647,7 @@ Session Token 通过 URL Query 参数传递，不使用 `Authorization` Header�
 **完整建连信令交互示例**
 
 ```
-Client                          Broker                    Media Gateway
+Client                          Broker                      Agent
   |                               |                            |
   |-- WS 连接 /api/v1/signal      |                            |
   |   ?token=<sessionToken> ----->|                            |
@@ -677,7 +677,7 @@ Client                          Broker                    Media Gateway
 WebRTC 视频轨道（H.264）采用双层渲染架构：
 
 ```
-Media Gateway
+Agent（在桌面实例内，Pion WebRTC 输出）
       ↓ WebRTC H.264 视频流
   <video> 元素（隐藏，负责硬件解码）
       ↓ requestAnimationFrame() 每帧 drawImage()
@@ -1065,7 +1065,7 @@ Client                              Broker
   |<-- WS 握手成功 -------------------|
   |                                   |
   |-- WS: { type: "offer", sdp: "..." }（重新发起 ICE 协商）
-  |                                   |-- 转发至 Media Gateway
+  |                                   |-- 转发至 Agent
   |<-- WS: { type: "answer", sdp: "..." }
   |                                   |
   （重走 ICE 协商，重建 WebRTC PeerConnection）
@@ -1454,6 +1454,6 @@ Content-Security-Policy:
 | `base-uri` | `'self'` | 防止 `<base>` 标签劫持相对路径 |
 | `form-action` | `'self'` | 限制表单提交目标，防止数据外泄 |
 
-> **注意**：`connect-src` 中的 `*.example.com` 为占位符，上线前需替换为实际 Broker 与 Media Gateway 域名。
+> **注意**：`connect-src` 中的 `*.example.com` 为占位符，上线前需替换为实际 Broker 与 Agent（通过桌面实例域名或 Broker 代理）的连接域名。
 
 ---
