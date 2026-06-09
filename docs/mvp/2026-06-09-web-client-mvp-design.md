@@ -10,12 +10,12 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         ���览器环境                                │
+│                         浏览器环境                                │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │  React 客户端（localhost:3000）                          │   │
-│  │  - Pion WebRTC PeerConnection                           │   │
-│  │  - Canvas 视频渲染                                      │   │
-│  │  - 键鼠事件通过 DataChannel 发送                         ���   │
+│  │  - WebRTC RTCPeerConnection (浏览器原生)                 │   │
+│  │  - <video> 元素渲染 MediaStream                         │   │
+│  │  - 键鼠事件通过 DataChannel 发送                         │   │
 │  └────────────────────────┬────────────────────────────────┘   │
 └───────────────────────────┼─────────────────────────────────────┘
                             │ WebSocket 信令 + WebRTC 媒体流
@@ -26,22 +26,23 @@
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │  Agent 容器（evdi-agent:8080）                           │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │  WebSocket 信令服务 (:8080/ws)                   │   │   │
+│  │  │  WebSocket 信令服务 (:8080/ws, 带 CORS)          │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │  Pion WebRTC 引擎 (Lite ICE)                    │   │   │
+│  │  │  Pion WebRTC 引擎 (Lite ICE, UDP 50000-50100)   │   │   │
 │  │  │  - PeerConnection                                │   │   │
 │  │  │  - VideoTrack (H.264)                            │   │   │
 │  │  │  - AudioTrack (Opus)                             │   │   │
 │  │  │  - DataChannel (control/bulk)                    │   │   │
 │  │  └──────────────────────┬──────────────────────────┘   │   │
-│  │                         ���                                  │   │
-│  │  ┌──────────────────────▼──────────────────────────┐   │   │
+│  │                         ▲                                  │   │
+│  │  ┌──────────────────────┴──────────────────────────┐   │   │
 │  │  │  GStreamer Pipeline (独立进程)                  │   │   │
-│  │  │  screen → x264enc → appsrc → Pion               │   │   │
+│  │  │  视频: ximagesrc → x264enc → appsink → Pion    │   │   │
+│  │  │  音频: pulsesrc → opusenc → appsink → Pion      │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │  虚拟显示 Xvfb (:99) + 轻量桌面 XFCE             │   │   │
+│  │  │  虚拟显示 Xvfb (:99) + PulseAudio + 轻量桌面 XFCE│   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
@@ -60,8 +61,7 @@
 ## 三、项目结构
 
 ```
-evdi-mvp/
-├── evdi-agent/                    # Go Agent
+evdi-agent/                        # Go Agent（与正式架构同名，代码可直接复用）
 │   ├── cmd/agent/
 │   │   └── main.go                # 入口
 │   ├── pkg/
@@ -80,7 +80,7 @@ evdi-mvp/
 │   ├── proto/                     # gRPC proto（暂不使用，预留）
 │   └── go.mod
 │
-├── evdi-web-client/               # React 客户端
+evdi-web-client/               # React 客户端（与正式架构同名，代码可直接复用）
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── VideoCanvas.tsx    # Canvas 视频渲染
@@ -98,23 +98,35 @@ evdi-mvp/
 │   ├── package.json
 │   └── vite.config.ts
 │
-├── docker-compose.yml             # Agent 部署配置
-├── Makefile                       # 构建脚本
-└── README.md
+docker-compose.yml                 # Agent 部署配置
+Makefile                           # 构建脚本
 ```
 
 ## 四、Agent 组件详细设计
 
 ### 4.1 WebSocket 信令服务
 
+> **MVP 限制**：当前设计仅支持单客户端连接，不处理多客户端并发场景。
+
 ```go
 type SignalingServer struct {
     addr      string
-    wsConn    *websocket.Conn
+    upgrader  websocket.Upgrader       // CORS 配置在此
+    wsConn    *websocket.Conn           // 单连接
     engine    *WebRTCEngine
     onOffer   chan *webrtc.SessionDescription
     onAnswer  chan *webrtc.SessionDescription
     onICE     chan *webrtc.ICECandidate
+}
+```
+
+**CORS 配置**：
+```go
+upgrader := websocket.Upgrader{
+    CheckOrigin: func(r *http.Request) bool {
+        // MVP 阶段允许所有来源，正式环境需限制
+        return true
+    },
 }
 ```
 
@@ -167,6 +179,11 @@ type Config struct {
 ```go
 settingsEngine := webrtc.SettingEngine{}
 settingsEngine.SetLite(true)  // Lite ICE 模式
+
+// 固定 WebRTC 媒体端口范围（需与 Docker 端口映射对应）
+portMin := uint16(50000)
+portMax := uint16(50100)
+settingsEngine.SetEphemeralUDPPortRange(portMin, portMax)
 ```
 
 ### 5.2 媒体轨道配置
@@ -180,17 +197,19 @@ settingsEngine.SetLite(true)  // Lite ICE 模式
 
 ### 5.3 SDP 协商流程（简化版）
 
+> **协商方向**：Client 发起 Offer，Agent 回复 Answer。与 Broker 架构文档（§9.2）保持一致，也是浏览器发起 WebRTC 的标准模式。Agent 架构文档（§3.1.4）中的 Agent 发 Offer 方式将在后续正式版本中统一修正。
+
 ```
 Client                    Agent
   |                          |
   |  -- WS: offer (SDP) --> |
-  |                          | 1. 创建 PeerConnection
+  |                          | 1. 收到 Offer，设置远程描述
   |                          | 2. 创建 Answer
-  |                          | 3. 等待 ICE 候选
+  |                          | 3. 设置本地描述
   |  <-- WS: answer (SDP) -- |
-  |  -- WS: ice (cand-1) --> |
+  |  -- WS: ice (cand-1) --> |  (Trickle ICE，候选逐条交换)
   |  <-- WS: ice (cand-1) -- |
-  ...                       | (Trickle ICE)
+  ...                       |
   |  DTLS 握手完成           |
   |  ✓ 连接建立                |
 ```
@@ -199,29 +218,47 @@ Client                    Agent
 
 ### 6.1 Pipeline 架构
 
+**视频管道**：
 ```
-xvfb屏幕(:99) → ximagesrc → videoconvert → x264enc
-                                                 ↓
-appsrc (收到 buffer) → Pion VideoTrack → Client
+xvfb屏幕(:99) → ximagesrc → videoconvert → x264enc → appsink → Pion VideoTrack → Client
+```
+
+**音频管道**：
+```
+PulseAudio → pulsesrc → audioconvert → audioresample → opusenc → appsink → Pion AudioTrack → Client
 ```
 
 ### 6.2 GStreamer Pipeline 代码
 
 ```go
-pipelineStr := `
+// 视频 Pipeline
+videoPipelineStr := `
 ximagesrc display-name=:99.0 !
 video/x-raw, framerate=30/1, width=1920, height=1080 !
 videoconvert !
 x264enc tune=zerolatency speed-preset=ultrafast !
 video/x-h264 !
-appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false
+appsink name=videosink emit-signals=true max-buffers=1 drop=true sync=false
+`
+
+// 音频 Pipeline
+audioPipelineStr := `
+pulsesrc device=EVDI.monitor !
+audio/x-raw, rate=48000, channels=2 !
+audioconvert !
+audioresample !
+opusenc bitrate=96000 !
+audio/x-opus !
+appsink name=audiosink emit-signals=true max-buffers=1 drop=true sync=false
 `
 
 type GStreamerPipeline struct {
-    pipeline   *gst.Pipeline
-    appSink    *gst.Element
-    videoTrack *webrtc.TrackLocalStaticSample
-    stopChan   chan struct{}
+    pipeline    *gst.Pipeline
+    videoSink   *gst.Element
+    audioSink   *gst.Element
+    videoTrack  *webrtc.TrackLocalStaticSample
+    audioTrack  *webrtc.TrackLocalStaticSample
+    stopChan    chan struct{}
 }
 ```
 
@@ -316,24 +353,40 @@ const sendMouseMove = (x: number, y: number) => {
 };
 ```
 
-### 7.4 Canvas 视频渲染
+### 7.4 视频渲染
+
+使用原生 `<video>` 元素，通过 `srcObject` 绑定 WebRTC MediaStream：
 
 ```typescript
-<ReactPlayer
-  url={mediaStream}
-  playing={connectionState === 'connected'}
-  controls={false}
-  width="100%"
-  height="100%"
-  style={{ pointerEvents: 'none' }}  // 事件穿透到 overlay 处理
-/>
+const VideoCanvas: React.FC<{ stream: MediaStream | null }> = ({ stream }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted
+      style={{
+        width: '100%',
+        height: '100%',
+        objectFit: 'contain',
+        pointerEvents: 'none',  // 事件穿透到 overlay 处理键鼠输入
+      }}
+    />
+  );
+};
 ```
 
 ## 八、Docker Compose 配置
 
 ```yaml
-version: '3.8'
-
 services:
   evdi-agent:
     build:
@@ -341,8 +394,9 @@ services:
       dockerfile: Dockerfile
     container_name: evdi-agent-mvp
     ports:
-      - "8080:8080"    # WebSocket 信令 + WebRTC
-      - "5900:5900"    # 可选：VNC 调试端口
+      - "8080:8080"       # WebSocket 信令
+      - "50000-50100:50000-50100/udp"  # WebRTC 媒体端口范围
+      - "5900:5900"       # 可选：VNC 调试端口
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix  # X11 socket（如需宿主机调试）
     environment:
@@ -351,6 +405,8 @@ services:
       - VIDEO_WIDTH=1920
       - VIDEO_HEIGHT=1080
       - VIDEO_FPS=30
+      - WEBRTC_PORT_MIN=50000
+      - WEBRTC_PORT_MAX=50100
     cap_add:
       - SYS_ADMIN  # 如需权限操作
 ```
@@ -387,6 +443,8 @@ clean:
 	rm -rf evdi-web-client/dist/
 ```
 
+> **注意**：Makefile 位于项目根目录，与 `evdi-agent/` 和 `evdi-web-client/` 同级。
+
 ## 十、技术依赖清单
 
 ### Agent 依赖
@@ -395,10 +453,11 @@ clean:
 import (
     "github.com/pion/webrtc/v4"
     "github.com/gorilla/websocket"
-    "github.com/lxn/win"  // Windows 输入（预留）
-    "github.com/robotn/gohide"  // Linux 虚拟输入
+    "github.com/tinyzimmer/go-gst/gst"  // GStreamer Go 绑定 (CGo)
 )
 ```
+
+**Linux 输入注入**：MVP 使用 `xdotool` 命令行工具（通过 `os/exec` 调用），无需 CGo 依赖。正式版本使用 XTest 扩展 (CGo) 以获得更低延迟。
 
 ### 客户端依赖
 
@@ -408,12 +467,13 @@ import (
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "zustand": "^4.4.0",
-    "antd": "^5.10.0",
-    "react-player": "^2.12.0"
+    "antd": "^5.10.0"
   },
   "devDependencies": {
     "vite": "^5.0.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0"
   }
 }
 ```
@@ -512,5 +572,4 @@ ws://localhost:8080/ws
 - [ ] React 客户端源码 (`evdi-web-client/`)
 - [ ] Docker Compose 配置
 - [ ] Makefile 构建/运行脚本
-- [ ] README 部署/使用文档
 - [ ] MVP 验证测试报告
