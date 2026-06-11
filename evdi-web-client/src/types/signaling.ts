@@ -1,7 +1,7 @@
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error'
 
 export interface SignalingMessage {
-  type: 'offer' | 'answer' | 'ice' | 'ping' | 'pong'
+  type: 'offer' | 'answer' | 'ice' | 'ping' | 'pong' | 'input.mouse_move' | 'input.mouse_button' | 'input.mouse_wheel' | 'input.key' | 'clipboard.push' | 'ctrl.resize'
   data: unknown
 }
 

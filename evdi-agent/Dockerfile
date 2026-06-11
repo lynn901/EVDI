@@ -1,4 +1,4 @@
-FROM golang:1.24-bookworm AS builder
+FROM docker.io/library/golang:1.24-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -7,27 +7,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 go build -o /agent ./cmd/agent
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
+RUN sed -i 's/main/main non-free/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/main/main non-free/g' /etc/apt/sources.list 2>/dev/null || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb xdotool \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly \
     gstreamer1.0-x gstreamer1.0-libav gstreamer1.0-tools \
     pulseaudio pulseaudio-utils \
     xfce4 xfce4-terminal \
-    dbus \
+    dbus dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /agent /usr/local/bin/agent
 
-RUN mkdir -p /etc/pulse && \
-    echo "default-server = /run/pulse/native" > /etc/pulse/client.conf && \
-    echo "autospawn = no" >> /etc/pulse/client.conf
+RUN mkdir -p /etc/pulse /run/pulse && \
+    echo "autospawn = yes" > /etc/pulse/client.conf
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

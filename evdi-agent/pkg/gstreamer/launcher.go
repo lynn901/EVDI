@@ -3,6 +3,7 @@ package gstreamer
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"syscall"
@@ -21,21 +22,19 @@ func NewGStreamerCmd(cfg *config.Config) *GStreamerCmd {
 }
 
 func (g *GStreamerCmd) Start() error {
-	// Video pipeline: ximagesrc -> x264enc -> stdout
-	// Audio pipeline: pulsesrc -> opusenc -> stdout
-	// For MVP, run both as a single gst-launch pipeline with fdsink
 	pipelineStr := fmt.Sprintf(
-		"ximagesrc display-name=%s ! "+
-			"video/x-raw, framerate=%d/1, width=%d, height=%d ! "+
-			"videoconvert ! "+
-			"x264enc tune=zerolatency speed-preset=ultrafast byte-stream=true ! "+
-			"video/x-h264, stream-format=byte-stream ! "+
+		"ximagesrc display-name=%s use-damage=false show-pointer=true startx=0 starty=0 endx=%d endy=%d ! "+
+			"video/x-raw,framerate=%d/1 ! "+
+			"videoconvert ! video/x-raw,format=I420 ! "+
+			"x264enc tune=zerolatency speed-preset=ultrafast byte-stream=true threads=1 ! "+
+			"video/x-h264,stream-format=byte-stream,profile=constrained-baseline ! "+
 			"fdsink fd=1 sync=false",
-		g.cfg.Display, g.cfg.VideoFPS, g.cfg.VideoWidth, g.cfg.VideoHeight,
+		g.cfg.Display, g.cfg.VideoWidth-1, g.cfg.VideoHeight-1, g.cfg.VideoFPS,
 	)
 
-	g.cmd = exec.Command("gst-launch-1.0", "-v", pipelineStr)
+	g.cmd = exec.Command("sh", "-c", "gst-launch-1.0 -v "+pipelineStr)
 	g.cmd.Env = append(os.Environ(), "DISPLAY="+g.cfg.Display)
+	log.Printf("[GStreamer] Starting pipeline: %s", pipelineStr)
 	g.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var err error
@@ -43,6 +42,23 @@ func (g *GStreamerCmd) Start() error {
 	if err != nil {
 		return fmt.Errorf("create stdout pipe: %w", err)
 	}
+
+	stderr, err := g.cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				log.Printf("[GStreamer] %s", string(buf[:n]))
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 
 	if err := g.cmd.Start(); err != nil {
 		return fmt.Errorf("start gst-launch: %w", err)

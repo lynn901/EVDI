@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/evdi/agent/pkg/config"
 	pionwebrtc "github.com/pion/webrtc/v4"
@@ -16,24 +17,40 @@ type SignalingMessage struct {
 	Data json.RawMessage `json:"data"`
 }
 
+// OnConnectFunc is called when a new WebRTC session is established,
+// providing the engine's media tracks for the caller to wire up.
+type OnConnectFunc func(engine *WebRTCEngine)
+
+// OnDisconnectFunc is called when the WebRTC session is torn down.
+type OnDisconnectFunc func()
+
+// OnInputFunc is called when an input event arrives over WebSocket.
+type OnInputFunc func(msg DataChannelMessage)
+
 // SignalingServer provides a WebSocket endpoint at /ws for SDP offer/answer
 // exchange and ICE candidate forwarding between the web client and the
-// Agent's WebRTC engine.
+// Agent's WebRTC engine. A new WebRTCEngine is created per connection.
 type SignalingServer struct {
-	addr     string
-	upgrader websocket.Upgrader
-	engine   *WebRTCEngine
+	addr         string
+	upgrader     websocket.Upgrader
+	cfg          *config.Config
+	onConnect    OnConnectFunc
+	onDisconnect OnDisconnectFunc
+	onInput      OnInputFunc
 }
 
 // NewSignalingServer creates a new SignalingServer bound to the WebSocket port
 // specified in cfg.
-func NewSignalingServer(cfg *config.Config, engine *WebRTCEngine) *SignalingServer {
+func NewSignalingServer(cfg *config.Config, onConnect OnConnectFunc, onDisconnect OnDisconnectFunc, onInput OnInputFunc) *SignalingServer {
 	return &SignalingServer{
 		addr:   ":" + cfg.WSPort,
-		engine: engine,
+		cfg:    cfg,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
+		onConnect:    onConnect,
+		onDisconnect: onDisconnect,
+		onInput:      onInput,
 	}
 }
 
@@ -53,11 +70,42 @@ func (s *SignalingServer) handleWebSocket(w http.ResponseWriter, r *http.Request
 	defer conn.Close()
 	log.Printf("Client connected from %s", conn.RemoteAddr())
 
+	// Create a fresh WebRTCEngine for this connection
+	engine, err := NewWebRTCEngine(s.cfg)
+	if err != nil {
+		log.Printf("Failed to create WebRTC engine: %v", err)
+		return
+	}
+	defer engine.Close()
+
+	// Notify caller about the new engine (wire up GStreamer, etc.)
+	if s.onConnect != nil {
+		s.onConnect(engine)
+	}
+	if s.onDisconnect != nil {
+		defer s.onDisconnect()
+	}
+
+	var writeMu sync.Mutex
+
+	sendSafe := func(msgType string, data interface{}) {
+		msg := SignalingMessage{
+			Type: msgType,
+			Data: mustMarshal(data),
+		}
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := conn.WriteJSON(msg); err != nil {
+			log.Printf("WebSocket write error: %v", err)
+		}
+	}
+
 	// Register ICE candidate callback to forward to client
-	s.engine.OnICECandidate(func(candidate *pionwebrtc.ICECandidate) {
+	engine.OnICECandidate(func(candidate *pionwebrtc.ICECandidate) {
 		if candidate != nil {
 			init := candidate.ToJSON()
-			s.sendSignal(conn, "ice", init)
+			log.Printf("Sending ICE candidate to client: %s", init.Candidate)
+			sendSafe("ice", init)
 		}
 	})
 
@@ -76,30 +124,35 @@ func (s *SignalingServer) handleWebSocket(w http.ResponseWriter, r *http.Request
 
 		switch msg.Type {
 		case "offer":
-			answer, err := s.engine.HandleOffer(msg.Data)
+			log.Printf("Received offer from client")
+			answer, err := engine.HandleOffer(msg.Data)
 			if err != nil {
 				log.Printf("HandleOffer error: %v", err)
 				continue
 			}
-			s.sendSignal(conn, "answer", answer)
+			log.Printf("Sending answer to client")
+			sendSafe("answer", answer)
 
 		case "ice":
-			if err := s.engine.HandleICECandidate(msg.Data); err != nil {
+			log.Printf("Received ICE candidate from client")
+			if err := engine.HandleICECandidate(msg.Data); err != nil {
 				log.Printf("HandleICE error: %v", err)
 			}
 
 		case "ping":
-			s.sendSignal(conn, "pong", map[string]int64{"ts": 0})
-		}
-	}
-}
+			sendSafe("pong", map[string]int64{"ts": 0})
 
-func (s *SignalingServer) sendSignal(conn *websocket.Conn, msgType string, data interface{}) {
-	msg := SignalingMessage{
-		Type: msgType,
-		Data: mustMarshal(data),
-	}
-	if err := conn.WriteJSON(msg); err != nil {
-		log.Printf("WebSocket write error: %v", err)
+		default:
+			// Input events: input.mouse_move, input.mouse_button, input.mouse_wheel, input.key, etc.
+			if s.onInput != nil {
+				log.Printf("[Input] Raw msg.Data: %s", string(msg.Data))
+				var dcMsg DataChannelMessage
+				if err := json.Unmarshal(msg.Data, &dcMsg); err != nil {
+					log.Printf("[Input] Unmarshal error: %v", err)
+				} else if dcMsg.Type != "" {
+					s.onInput(dcMsg)
+				}
+			}
+		}
 	}
 }

@@ -26,13 +26,19 @@ export function useWebRTC() {
       const pc = new RTCPeerConnection({ iceServers: [] })
       pcRef.current = pc
 
+      // Queue ICE candidates until remote description is set
+      const pendingICE: ICEPayload[] = []
+
+      // Merge all remote tracks into a single MediaStream.
+      const combinedStream = new MediaStream()
       pc.ontrack = (event) => {
-        if (event.streams.length > 0) {
-          setMediaStream(event.streams[0])
-        }
+        combinedStream.addTrack(event.track)
+        // Create a new reference so Zustand detects the change
+        setMediaStream(new MediaStream(combinedStream.getTracks()))
       }
 
       pc.onconnectionstatechange = () => {
+        console.log('[WebRTC] Connection state:', pc.connectionState)
         switch (pc.connectionState) {
           case 'connected':
             setConnectionState('connected')
@@ -43,6 +49,10 @@ export function useWebRTC() {
             setError('连接已断开')
             break
         }
+      }
+
+      pc.oniceconnectionstatechange = () => {
+        console.log('[WebRTC] ICE connection state:', pc.iceConnectionState)
       }
 
       pc.addTransceiver('video', { direction: 'recvonly' })
@@ -56,8 +66,9 @@ export function useWebRTC() {
       const signaling = new SignalingClient()
       signalingRef.current = signaling
 
-      signaling.connect(agentAddress, (msg: SignalingMessage) => {
-        handleSignalingMessage(pc, signaling, msg)
+      // Wait for WebSocket to open before sending offer/ICE
+      await signaling.connect(agentAddress, (msg: SignalingMessage) => {
+        handleSignalingMessage(pc, msg, pendingICE)
       })
 
       pc.onicecandidate = (event) => {
@@ -96,26 +107,50 @@ export function useWebRTC() {
     reset()
   }, [reset])
 
-  const sendDataChannelMessage = useCallback((channel: 'control' | 'bulk', msgType: string, payload: unknown) => {
-    const ch = channel === 'control' ? controlChannelRef.current : bulkChannelRef.current
-    if (ch?.readyState === 'open') {
-      ch.send(JSON.stringify({
+  const sendInputMessage = useCallback((msgType: string, payload: unknown) => {
+    const signaling = signalingRef.current
+    if (!signaling) {
+      console.warn('[Input] No signaling connection')
+      return
+    }
+    signaling.send({
+      type: msgType as SignalingMessage['type'],
+      data: {
         v: 1,
         type: msgType,
         ts: Date.now(),
         seq: nextSeq(),
         payload,
-      }))
-    }
+      },
+    })
   }, [nextSeq])
 
-  return { connect, disconnect, sendDataChannelMessage }
+  const sendDataChannelMessage = useCallback((channel: 'control' | 'bulk', msgType: string, payload: unknown) => {
+    const ch = channel === 'control' ? controlChannelRef.current : bulkChannelRef.current
+    if (!ch) {
+      console.warn('[DataChannel] No channel:', channel)
+      return
+    }
+    if (ch.readyState !== 'open') {
+      console.warn('[DataChannel] Channel not open:', channel, ch.readyState)
+      return
+    }
+    ch.send(JSON.stringify({
+      v: 1,
+      type: msgType,
+      ts: Date.now(),
+      seq: nextSeq(),
+      payload,
+    }))
+  }, [nextSeq])
+
+  return { connect, disconnect, sendDataChannelMessage, sendInputMessage }
 }
 
 async function handleSignalingMessage(
   pc: RTCPeerConnection,
-  _signaling: SignalingClient,
   msg: SignalingMessage,
+  pendingICE: ICEPayload[],
 ) {
   switch (msg.type) {
     case 'answer': {
@@ -124,15 +159,29 @@ async function handleSignalingMessage(
         sdp: data.sdp,
         type: data.type as RTCSdpType,
       }))
+      // Apply any queued ICE candidates
+      for (const ice of pendingICE) {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: ice.candidate,
+          sdpMid: ice.sdpMid,
+          sdpMLineIndex: ice.sdpMLineIndex,
+        }))
+      }
+      pendingICE.length = 0
       break
     }
     case 'ice': {
       const data = msg.data as ICEPayload
-      await pc.addIceCandidate(new RTCIceCandidate({
-        candidate: data.candidate,
-        sdpMid: data.sdpMid,
-        sdpMLineIndex: data.sdpMLineIndex,
-      }))
+      if (pc.remoteDescription) {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: data.candidate,
+          sdpMid: data.sdpMid,
+          sdpMLineIndex: data.sdpMLineIndex,
+        }))
+      } else {
+        // Queue until remote description is set
+        pendingICE.push(data)
+      }
       break
     }
   }

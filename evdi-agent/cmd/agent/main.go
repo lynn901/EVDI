@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/evdi/agent/pkg/config"
@@ -16,8 +17,9 @@ import (
 
 func main() {
 	cfg := config.Load()
-	log.Printf("EVDI Agent starting, WS port=%s, display=%s, video=%dx%d@%dfps",
-		cfg.WSPort, cfg.Display, cfg.VideoWidth, cfg.VideoHeight, cfg.VideoFPS)
+	log.Printf("EVDI Agent starting, WS port=%s, display=%s, video=%dx%d@%dfps, webrtc-ports=%d-%d, nat1to1=%s",
+		cfg.WSPort, cfg.Display, cfg.VideoWidth, cfg.VideoHeight, cfg.VideoFPS,
+		cfg.WebRTCPortMin, cfg.WebRTCPortMax, cfg.NAT1To1IP)
 
 	// 1. 启动 Xvfb
 	xvfb := display.NewXvfb(cfg)
@@ -27,32 +29,65 @@ func main() {
 	defer xvfb.Stop()
 	log.Printf("Xvfb started on %s", cfg.Display)
 
-	// 2. 创建 WebRTC 引擎
-	engine, err := webrtc.NewWebRTCEngine(cfg)
-	if err != nil {
-		log.Fatalf("Failed to create WebRTC engine: %v", err)
-	}
-	defer engine.Close()
-
-	// 3. 注册 DataChannel 回调 - 将输入事件转发到 xdotool
-	engine.OnDataChannel(func(channel string, msg webrtc.DataChannelMessage) {
-		handleDataChannelMessage(msg)
-	})
-
-	// 4. 启动信令服务器（在连接建立后再启动 GStreamer）
-	sigServer := webrtc.NewSignalingServer(cfg, engine)
-
-	// 监听 PeerConnection 连接状态
+	// Mouse move coalescing: only execute the latest position
+	mouseCh := make(chan webrtc.MouseMovePayload, 64)
 	go func() {
-		// TODO: 在正式版本中，应在连接建立后启动 GStreamer
-		// MVP 中直接启动
-		pipe := gstreamer.NewPipeline(cfg, engine.VideoTrack(), engine.AudioTrack())
-		if err := pipe.Start(); err != nil {
-			log.Printf("Failed to start GStreamer: %v", err)
-			return
+		for p := range mouseCh {
+			input.MouseMoveCmd(p.X, p.Y).Start()
+			// Drain any queued-up positions, keep only the latest
+			drained := 0
+			for {
+				select {
+				case p2 := <-mouseCh:
+					p = p2
+					drained++
+				default:
+					goto execute
+				}
+			}
+		execute:
+			if drained > 0 {
+				input.MouseMoveCmd(p.X, p.Y).Start()
+			}
 		}
-		defer pipe.Stop()
 	}()
+
+	// 2. 创建信令服务器，每次连接创建新 Engine + GStreamer
+	var pipelineMu sync.Mutex
+	var currentPipeline *gstreamer.Pipeline
+
+	sigServer := webrtc.NewSignalingServer(cfg,
+		func(engine *webrtc.WebRTCEngine) {
+			pipelineMu.Lock()
+			defer pipelineMu.Unlock()
+			if currentPipeline != nil {
+				currentPipeline.Stop()
+			}
+			pipe := gstreamer.NewPipeline(cfg, engine.VideoTrack(), engine.AudioTrack())
+			if err := pipe.Start(); err != nil {
+				log.Printf("Failed to start GStreamer: %v", err)
+				return
+			}
+			currentPipeline = pipe
+			log.Printf("GStreamer pipeline started for new connection")
+
+			engine.OnDataChannel(func(channel string, msg webrtc.DataChannelMessage) {
+				handleInputMessage(msg, mouseCh)
+			})
+		},
+		func() {
+			pipelineMu.Lock()
+			defer pipelineMu.Unlock()
+			if currentPipeline != nil {
+				currentPipeline.Stop()
+				currentPipeline = nil
+			}
+			log.Printf("GStreamer pipeline stopped, connection closed")
+		},
+		func(msg webrtc.DataChannelMessage) {
+			handleInputMessage(msg, mouseCh)
+		},
+	)
 
 	go func() {
 		if err := sigServer.Start(); err != nil {
@@ -68,27 +103,32 @@ func main() {
 	log.Printf("Shutting down...")
 }
 
-func handleDataChannelMessage(msg webrtc.DataChannelMessage) {
+func handleInputMessage(msg webrtc.DataChannelMessage, mouseCh chan<- webrtc.MouseMovePayload) {
 	switch msg.Type {
 	case "input.mouse_move":
 		var p webrtc.MouseMovePayload
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			input.MouseMoveCmd(p.X, p.Y).Run()
+			select {
+			case mouseCh <- p:
+			default:
+			}
 		}
 	case "input.mouse_button":
 		var p webrtc.MouseButtonPayload
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			input.MouseButtonCmd(p.Button, p.Action).Run()
+			input.MouseMoveCmd(p.X, p.Y).Start()
+			input.MouseButtonCmd(p.Button, p.Action).Start()
 		}
 	case "input.mouse_wheel":
 		var p webrtc.MouseWheelPayload
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			input.MouseWheelCmd(p.DeltaX, p.DeltaY).Run()
+			input.MouseWheelCmd(p.DeltaX, p.DeltaY).Start()
 		}
 	case "input.key":
 		var p webrtc.KeyPayload
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			input.KeyCmd(p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt).Run()
+			log.Printf("[Input] key: keycode=%d action=%s shift=%v ctrl=%v alt=%v", p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt)
+			input.KeyCmd(p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt).Start()
 		}
 	case "clipboard.push":
 		log.Printf("Clipboard push received (MVP: no-op)")

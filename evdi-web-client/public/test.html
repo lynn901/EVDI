@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html><head><title>EVDI Debug Test</title></head>
+<body>
+<h2>EVDI WebRTC Debug</h2>
+<div id="status">Connecting...</div>
+<div tabindex="0" id="videoContainer" style="width:960px;height:540px;position:relative;outline:none">
+<video id="video" autoplay playsinline muted style="width:100%;height:100%;object-fit:contain;background:#000;pointer-events:none"></video>
+</div>
+<p style="font-size:12px;color:#666">Click the video area first, then use keyboard</p>
+<pre id="log" style="font-size:12px;max-height:300px;overflow:auto"></pre>
+<script>
+const log = msg => { document.getElementById('log').textContent += msg + '\n'; console.log(msg); };
+const video = document.getElementById('video');
+const container = document.getElementById('videoContainer');
+let seq = 0;
+
+let ws, pc;
+
+function sendInput(type, payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const msg = { type: type, data: { v: 1, type: type, ts: Date.now(), seq: ++seq, payload: payload } };
+    ws.send(JSON.stringify(msg));
+    if (payload.x !== undefined) log('Sent ' + type + ': (' + payload.x + ',' + payload.y + ')');
+    else log('Sent input: ' + type + ' ' + JSON.stringify(payload));
+  }
+}
+
+async function start() {
+  ws = new WebSocket('ws://172.26.185.252:8080/ws');
+  ws.onopen = () => log('WS connected');
+  ws.onerror = e => log('WS error');
+  ws.onclose = () => log('WS closed');
+
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  const combinedStream = new MediaStream();
+  pc.ontrack = e => {
+    log('ontrack: kind=' + e.track.kind);
+    combinedStream.addTrack(e.track);
+    video.srcObject = new MediaStream(combinedStream.getTracks());
+    video.play().then(() => log('play() succeeded')).catch(e => log('play() failed: ' + e.message));
+  };
+
+  pc.oniceconnectionstatechange = () => log('ICE: ' + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => log('Conn: ' + pc.connectionState);
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  const controlCh = pc.createDataChannel('control', { ordered: true });
+  controlCh.onopen = () => log('Control channel OPEN');
+  controlCh.onclose = () => log('Control channel CLOSED');
+  controlCh.onerror = e => log('Control channel ERROR: ' + e);
+  controlCh.onmessage = e => log('Control channel RECV: ' + e.data);
+
+  // Mouse events on container
+  container.addEventListener('mousemove', e => {
+    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+    const rect = container.getBoundingClientRect();
+    const x = Math.round((e.offsetX / rect.width) * video.videoWidth);
+    const y = Math.round((e.offsetY / rect.height) * video.videoHeight);
+    sendInput('input.mouse_move', { x, y, display_id: 0 });
+  });
+
+  container.addEventListener('mousedown', e => {
+    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+    const rect = container.getBoundingClientRect();
+    const x = Math.round((e.offsetX / rect.width) * video.videoWidth);
+    const y = Math.round((e.offsetY / rect.height) * video.videoHeight);
+    sendInput('input.mouse_button', { button: e.button + 1, action: 'down', x, y });
+  });
+
+  container.addEventListener('mouseup', e => {
+    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+    const rect = container.getBoundingClientRect();
+    const x = Math.round((e.offsetX / rect.width) * video.videoWidth);
+    const y = Math.round((e.offsetY / rect.height) * video.videoHeight);
+    sendInput('input.mouse_button', { button: e.button + 1, action: 'up', x, y });
+  });
+
+  // Keyboard events on container (needs tabindex and focus)
+  container.addEventListener('keydown', e => {
+    e.preventDefault();
+    sendInput('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+  });
+
+  container.addEventListener('keyup', e => {
+    e.preventDefault();
+    sendInput('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+  });
+
+  // Auto-focus container on click
+  container.addEventListener('click', () => container.focus());
+
+  pc.onicecandidate = e => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'ice', data: e.candidate.toJSON() }));
+  };
+
+  ws.onmessage = async e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'answer') {
+      log('Got answer SDP (first 200): ' + msg.data.sdp.substring(0, 200));
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+    } else if (msg.type === 'ice') {
+      await pc.addIceCandidate(new RTCIceCandidate(msg.data));
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  log('Sent offer (first 200): ' + offer.sdp.substring(0, 200));
+  ws.send(JSON.stringify({ type: 'offer', data: offer }));
+}
+
+video.addEventListener('loadedmetadata', () => log('video loadedmetadata: ' + video.videoWidth + 'x' + video.videoHeight));
+video.addEventListener('play', () => log('video playing'));
+video.addEventListener('error', e => log('video error: ' + e.target.error?.message));
+video.addEventListener('waiting', () => log('video waiting'));
+
+start();
+</script>
+</body></html>

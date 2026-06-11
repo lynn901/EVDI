@@ -1,3 +1,4 @@
+CONTAINER_RUNTIME ?= podman-compose
 .PHONY: build-agent build-client run-agent run-docker run-client clean
 
 build-agent:
@@ -10,12 +11,12 @@ run-agent:
 	cd evdi-agent && go run ./cmd/agent
 
 run-docker:
-	docker compose up --build
+	$(CONTAINER_RUNTIME) up --build
 
 run-client:
 	cd evdi-web-client && npm run dev
 
 clean:
-	docker compose down -v
+	$(CONTAINER_RUNTIME) down -v
 	rm -rf evdi-agent/bin/
 	rm -rf evdi-web-client/dist/

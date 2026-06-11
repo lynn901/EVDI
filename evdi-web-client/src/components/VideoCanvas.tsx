@@ -8,11 +8,14 @@ interface Props {
 
 export const VideoCanvas: React.FC<Props> = ({ stream }) => {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const { sendDataChannelMessage } = useWebRTC()
+  const { sendInputMessage } = useWebRTC()
 
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream
+    const video = videoRef.current
+    if (video && stream) {
+      video.srcObject = stream
+      const p = video.play()
+      if (p) p.catch((err) => { if (err.name !== 'AbortError') console.warn('[VideoCanvas] play() failed:', err) })
     }
   }, [stream])
 
@@ -45,33 +48,33 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const { x, y } = getRelativePos(e)
-    sendDataChannelMessage('control', 'input.mouse_move', { x, y, display_id: 0 } satisfies MouseMovePayload)
-  }, [getRelativePos, sendDataChannelMessage])
+    sendInputMessage('input.mouse_move', { x, y, display_id: 0 } satisfies MouseMovePayload)
+  }, [getRelativePos, sendInputMessage])
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const { x, y } = getRelativePos(e)
-    sendDataChannelMessage('control', 'input.mouse_button', { button: e.button + 1, action: 'down', x, y } satisfies MouseButtonPayload)
-  }, [getRelativePos, sendDataChannelMessage])
+    sendInputMessage('input.mouse_button', { button: e.button + 1, action: 'down', x, y } satisfies MouseButtonPayload)
+  }, [getRelativePos, sendInputMessage])
 
   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const { x, y } = getRelativePos(e)
-    sendDataChannelMessage('control', 'input.mouse_button', { button: e.button + 1, action: 'up', x, y } satisfies MouseButtonPayload)
-  }, [getRelativePos, sendDataChannelMessage])
+    sendInputMessage('input.mouse_button', { button: e.button + 1, action: 'up', x, y } satisfies MouseButtonPayload)
+  }, [getRelativePos, sendInputMessage])
 
   const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
     const { x, y } = getRelativePos(e)
-    sendDataChannelMessage('control', 'input.mouse_wheel', { delta_x: e.deltaX, delta_y: e.deltaY, x, y } satisfies MouseWheelPayload)
-  }, [getRelativePos, sendDataChannelMessage])
+    sendInputMessage('input.mouse_wheel', { delta_x: e.deltaX, delta_y: e.deltaY, x, y } satisfies MouseWheelPayload)
+  }, [getRelativePos, sendInputMessage])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     e.preventDefault()
-    sendDataChannelMessage('control', 'input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
-  }, [sendDataChannelMessage])
+    sendInputMessage('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+  }, [sendInputMessage])
 
   const handleKeyUp = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     e.preventDefault()
-    sendDataChannelMessage('control', 'input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
-  }, [sendDataChannelMessage])
+    sendInputMessage('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+  }, [sendInputMessage])
 
   return (
     <div

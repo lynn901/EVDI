@@ -3,6 +3,7 @@ package webrtc
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/evdi/agent/pkg/config"
 	"github.com/pion/webrtc/v4"
@@ -30,11 +31,40 @@ func NewWebRTCEngine(cfg *config.Config) (*WebRTCEngine, error) {
 	if err := settingsEngine.SetEphemeralUDPPortRange(cfg.WebRTCPortMin, cfg.WebRTCPortMax); err != nil {
 		return nil, fmt.Errorf("set ephemeral UDP port range: %w", err)
 	}
+	if cfg.NAT1To1IP != "" {
+		settingsEngine.SetNAT1To1IPs([]string{cfg.NAT1To1IP}, webrtc.ICECandidateTypeHost)
+	}
 
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingsEngine))
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:     webrtc.MimeTypeH264,
+			ClockRate:    90000,
+			Channels:     0,
+			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
+		PayloadType: 96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, fmt.Errorf("register H264 codec: %w", err)
+	}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: 48000,
+			Channels:  2,
+		},
+		PayloadType: 111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, fmt.Errorf("register Opus codec: %w", err)
+	}
+
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(settingsEngine))
 
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			SDPFmtpLine: "profile-level-id=42e01f;packetization-mode=1",
+		},
 		"video", "evdi-desktop",
 	)
 	if err != nil {
@@ -81,17 +111,37 @@ func (e *WebRTCEngine) registerHandlers() {
 		}
 	})
 	e.peerConnection.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Printf("[DataChannel] New channel: %s, state: %s", dc.Label(), dc.ReadyState().String())
+		dc.OnOpen(func() {
+			log.Printf("[DataChannel] Channel OPEN: %s", dc.Label())
+		})
+		dc.OnClose(func() {
+			log.Printf("[DataChannel] Channel CLOSED: %s", dc.Label())
+		})
+		dc.OnError(func(err error) {
+			log.Printf("[DataChannel] Channel ERROR: %s, err: %v", dc.Label(), err)
+		})
 		switch dc.Label() {
 		case "control":
 			e.channelControl = dc
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 				e.handleDataChannelMessage("control", msg.Data)
 			})
+			dc.OnOpen(func() {
+				log.Printf("[DataChannel] Channel OPEN (inside switch): %s, sending test", dc.Label())
+				if err := dc.SendText(`{"v":1,"type":"ctrl.ping","ts":0,"seq":0,"payload":{}}`); err != nil {
+					log.Printf("[DataChannel] Send test error: %v", err)
+				} else {
+					log.Printf("[DataChannel] Send test OK")
+				}
+			})
 		case "bulk":
 			e.channelBulk = dc
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 				e.handleDataChannelMessage("bulk", msg.Data)
 			})
+		default:
+			log.Printf("[DataChannel] Unknown channel: %s", dc.Label())
 		}
 	})
 }
@@ -125,6 +175,7 @@ func (e *WebRTCEngine) HandleOffer(offerData json.RawMessage) (json.RawMessage, 
 	if err != nil {
 		return nil, fmt.Errorf("create answer: %w", err)
 	}
+	log.Printf("[SDP] Answer:\n%s", answer.SDP)
 	if err := e.peerConnection.SetLocalDescription(answer); err != nil {
 		return nil, fmt.Errorf("set local description: %w", err)
 	}
@@ -150,6 +201,7 @@ func (e *WebRTCEngine) Close() {
 func (e *WebRTCEngine) handleDataChannelMessage(channel string, data []byte) {
 	var msg DataChannelMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("[DataChannel] Failed to parse message on %s: %v", channel, err)
 		return
 	}
 	if e.onDataChannel != nil {

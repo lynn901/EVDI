@@ -6,7 +6,7 @@ import (
 )
 
 func MouseMoveCmd(x, y int) *exec.Cmd {
-	return exec.Command("xdotool", "mousemove", "--sync", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y))
+	return exec.Command("xdotool", "mousemove", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y))
 }
 
 func MouseButtonCmd(button int, action string) *exec.Cmd {

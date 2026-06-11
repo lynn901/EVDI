@@ -17,7 +17,7 @@ interface ConnectionStore {
 }
 
 export const useConnectionStore = create<ConnectionStore>((set, get) => ({
-  agentAddress: 'ws://localhost:8080/ws',
+  agentAddress: 'ws://172.26.185.252:8080/ws',
   connectionState: 'disconnected',
   mediaStream: null,
   errorMessage: null,
