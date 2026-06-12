@@ -373,6 +373,80 @@ if keycode >= 48 && keycode <= 57 {
 
 **踩坑**：最初尝试 `show-cursor=true`（不存在），报 "no property show-cursor"。正确属性名是 `show-pointer=true`（依赖 XFixes 扩展）。
 
+### 5.8 React 客户端输入事件无法发送
+
+**现象**：test.html 正常工作，但 React 客户端（`http://127.0.0.1:3000/`）的鼠标键盘操作没有任何效果。
+
+**根因**：`useWebRTC()` Hook 在 `ControlPanel` 和 `VideoCanvas` 中被分别调用，创建了两个独立实例。`ControlPanel` 调用 `connect()` 建立 WebSocket 连接，但 `VideoCanvas` 的实例中 `signalingRef.current` 始终为 `null`，导致 `sendInputMessage` 无法发送任何事件。
+
+**修复**：将 `sendInput` 函数存入 Zustand store（`connectionStore.sendInputFn`），`ControlPanel` 的 `connect()` 在创建连接时注册该函数，`VideoCanvas` 直接从 store 调用 `sendInput()`，不再依赖独立的 `useWebRTC` 实例。
+
+```typescript
+// connectionStore.ts
+sendInputFn: ((msgType: string, payload: unknown) => void) | null
+setSendInputFn: (fn) => set({ sendInputFn: fn })
+sendInput: (msgType, payload) => { get().sendInputFn?.(msgType, payload) }
+
+// useWebRTC.ts connect() 中
+setSendInputFn((msgType: string, payload: unknown) => {
+  if (signaling && signaling.isOpen()) {
+    signaling.send({ type: msgType, data: { v:1, type: msgType, ts: Date.now(), seq: nextSeq(), payload } })
+  }
+})
+
+// VideoCanvas.tsx
+const sendInput = useConnectionStore((s) => s.sendInput)
+```
+
+### 5.9 浏览器默认行为干扰
+
+**现象**：右键点击视频区域弹出浏览器菜单，滚轮触发页面滚动。
+
+**原因**：React 的 `onWheel` 事件默认是 passive listener，无法调用 `preventDefault()`。`onMouseDown`/`onContextMenu` 也需要主动阻止默认行为。
+
+**修复**：
+1. `mousedown`/`mouseup`/`contextmenu` 添加 `e.preventDefault()`
+2. `wheel` 事件改用 `addEventListener('wheel', handler, { passive: false })` 手动绑定
+3. 添加 `userSelect: 'none'` CSS 样式防止文字选中
+
+### 5.10 Zombie 进程耗尽容器资源
+
+**现象**：使用一段时间后画面卡死，容器无法执行任何命令（`fork: Resource temporarily unavailable`）。
+
+**根因**：`exec.Command.Start()` 启动的 xdotool 子进程完成后变成 zombie（没有人调用 `wait()` 回收）。高频鼠标事件每秒产生数十个 xdotool 进程，zombie 累积到系统 PID 上限，容器无法创建新进程。
+
+**修复**：在 Agent 启动时添加 zombie 回收 goroutine：
+
+```go
+func init() {
+    go func() {
+        for {
+            syscall.Wait4(-1, nil, 0, nil)
+        }
+    }()
+}
+```
+
+`syscall.Wait4(-1, ...)` 会等待任意子进程退出并回收，防止 zombie 堆积。
+
+### 5.11 容器重启后 XFCE 桌面缺失
+
+**现象**：容器重启或强制停止后恢复，连接成功但黑屏——Xvfb 运行但 XFCE 桌面未启动。
+
+**原因**：Agent 的 `xvfb.Start()` 会启动新的 Xvfb 进程，但入口脚本中的 XFCE 桌面启动命令可能在 Agent 之前执行完毕后就不再运行。容器强制重启后，只有 `sleep infinity`（PID 1）和入口脚本启动的基础服务在运行，XFCE 需要手动启动。
+
+**解决**：确保容器入口脚本在启动 Xvfb 后也启动 XFCE 桌面环境，或修改 Agent 逻辑检测桌面是否已运行。
+
+### 5.12 本地与远程鼠标光标重叠
+
+**现象**：浏览器本地鼠标光标和云桌面的鼠标光标同时显示，视觉上出现双光标重叠。
+
+**解决**：在视频容器上设置 CSS `cursor: none`，鼠标悬停在视频区域时隐藏本地光标，只显示云桌面的光标（由 `ximagesrc show-pointer=true` 捕获传输）。
+
+```css
+style={{ cursor: 'none' }}
+```
+
 ---
 
 ## 六、关键经验总结
@@ -403,6 +477,10 @@ if keycode >= 48 && keycode <= 57 {
 | ontrack 合并流 | Pion 为 video/audio 创建不同 MSID，必须合并到同一个 MediaStream |
 | play() 调用 | 设置 srcObject 后必须显式调用 play()，并捕获 AbortError |
 | 视频坐标映射 | 必须等 `loadedmetadata` 后才能使用 `videoWidth/videoHeight` 进行坐标映射 |
+| React Hook 实例隔离 | `useWebRTC()` 在不同组件中创建独立实例，signaling ref 不共享。必须通过 Zustand store 传递 sendInput 函数 |
+| passive 事件 | React 的 `onWheel` 是 passive listener，必须用 `addEventListener('wheel', handler, { passive: false })` 手动绑定 |
+| 浏览器默认行为 | 必须在 mousedown/mouseup/contextmenu/dblclick/dragstart 上调用 `preventDefault()`，加 `userSelect: 'none'` |
+| 双光标问题 | 本地光标与远程光标重叠时，在视频容器上设置 `cursor: none` 隐藏本地光标 |
 
 ### 6.4 输入事件优化要点
 
@@ -413,6 +491,7 @@ if keycode >= 48 && keycode <= 57 {
 | 去掉 --sync | xdotool 的 `--sync` 在高频场景下造成严重延迟 |
 | KeyCode 体系 | 浏览器 `e.keyCode` 是 Windows Virtual Key Code（A=65），不是 USB HID Code（A=4） |
 | 修饰键 | `xdotool keydown "ctrl+A"` 不等于"按住ctrl按A"，用 `xdotool key --clearmodifiers ctrl+A` |
+| Zombie 回收 | `exec.Command.Start()` 启动的进程必须有人 wait，否则变成 zombie。用 `syscall.Wait4(-1, ...)` goroutine 回收 |
 
 ---
 
@@ -467,9 +546,10 @@ if keycode >= 48 && keycode <= 57 {
 | 优先级 | 事项 | 说明 |
 |--------|------|------|
 | P1 | 音频流测试 | 当前 Pipeline 只实现了视频，PulseAudio → Opus 通路待验证 |
-| P1 | 键盘输入测试 | xdotool keydown/keyup 命令已实现，待端到端验证 |
+| ~~P1~~ | ~~容器入口脚本优化~~ | ~~Agent 的 `xvfb.Start()` 可能与入口脚本冲突，需统一 Xvfb/XFCE 启动逻辑~~ **已解决**：Agent 不再启动 Xvfb，由 entrypoint.sh 统一管理，supervise 自动恢复，见 `docs/mvp/mvp-dev-debug-guide.md` |
 | P2 | DataChannel 双向修复 | 升级 Pion 或调整 ICE 配置，恢复 DataChannel 双向通信 |
 | P2 | 生产镜像构建 | 优化 Dockerfile 多阶段构建，减小镜像体积 |
 | P2 | 断线重连 | WebSocket/WebRTC 断线后的自动重连机制 |
+| P2 | 清理 debug 日志 | 移除 H264 Frame 计数、Raw msg.Data 等调试日志 |
 | P3 | 输入方式优化 | 考虑 CGo 直接调用 XTest 扩展，替代 xdotool 进程创建开销 |
-| P3 | 清理 debug 日志 | 移除 H264 Frame 计数等调试日志 |
+| P3 | xdotool 修饰键状态管理 | 当前 `xdotool key --clearmodifiers` 可能与手动 keydown/keyup 修饰键冲突 |

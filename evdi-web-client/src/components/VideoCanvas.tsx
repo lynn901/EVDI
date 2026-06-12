@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { useWebRTC } from '../hooks/useWebRTC'
+import { useConnectionStore } from '../stores/connectionStore'
 import type { MouseMovePayload, MouseButtonPayload, MouseWheelPayload, KeyPayload } from '../types/signaling'
 
 interface Props {
@@ -8,83 +8,109 @@ interface Props {
 
 export const VideoCanvas: React.FC<Props> = ({ stream }) => {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const { sendInputMessage } = useWebRTC()
+  const containerRef = useRef<HTMLDivElement>(null)
+  const sendInput = useConnectionStore((s) => s.sendInput)
 
   useEffect(() => {
     const video = videoRef.current
     if (video && stream) {
       video.srcObject = stream
-      const p = video.play()
-      if (p) p.catch((err) => { if (err.name !== 'AbortError') console.warn('[VideoCanvas] play() failed:', err) })
+      video.play().catch((err) => {
+        if (err.name !== 'AbortError') console.warn('[VideoCanvas] play() failed:', err)
+      })
     }
   }, [stream])
 
-  const getRelativePos = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect()
-    const video = videoRef.current
-    if (!video) return { x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY }
+  // Register all native event listeners with proper preventDefault handling.
+  // React synthetic events don't allow { passive: false } for wheel,
+  // and some events (dblclick, drag, selectstart) aren't easily handled in React.
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
 
-    const videoRatio = video.videoWidth / video.videoHeight
-    const containerRatio = rect.width / rect.height
-
-    let renderWidth: number, renderHeight: number, offsetX: number, offsetY: number
-    if (containerRatio > videoRatio) {
-      renderHeight = rect.height
-      renderWidth = renderHeight * videoRatio
-      offsetX = (rect.width - renderWidth) / 2
-      offsetY = 0
-    } else {
-      renderWidth = rect.width
-      renderHeight = renderWidth / videoRatio
-      offsetX = 0
-      offsetY = (rect.height - renderHeight) / 2
+    const getPos = (e: MouseEvent | WheelEvent) => {
+      const video = videoRef.current
+      const rect = container.getBoundingClientRect()
+      if (!video || video.videoWidth === 0) return { x: 0, y: 0 }
+      const x = Math.round((e.offsetX / rect.width) * video.videoWidth)
+      const y = Math.round((e.offsetY / rect.height) * video.videoHeight)
+      return { x, y }
     }
 
-    return {
-      x: Math.round(((e.nativeEvent.offsetX - offsetX) / renderWidth) * video.videoWidth),
-      y: Math.round(((e.nativeEvent.offsetY - offsetY) / renderHeight) * video.videoHeight),
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const { x, y } = getPos(e)
+      sendInput('input.mouse_wheel', { delta_x: e.deltaX, delta_y: e.deltaY, x, y } satisfies MouseWheelPayload)
     }
+
+    const onMouseDown = (e: MouseEvent) => {
+      e.preventDefault()
+      const { x, y } = getPos(e)
+      sendInput('input.mouse_button', { button: e.button + 1, action: 'down', x, y } satisfies MouseButtonPayload)
+    }
+
+    const onMouseUp = (e: MouseEvent) => {
+      e.preventDefault()
+      const { x, y } = getPos(e)
+      sendInput('input.mouse_button', { button: e.button + 1, action: 'up', x, y } satisfies MouseButtonPayload)
+    }
+
+    const onMouseMove = (e: MouseEvent) => {
+      const { x, y } = getPos(e)
+      sendInput('input.mouse_move', { x, y, display_id: 0 } satisfies MouseMovePayload)
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      sendInput('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+    }
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      sendInput('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+    }
+
+    // Block all browser default behaviors that interfere with remote desktop
+    const blockDefault = (e: Event) => e.preventDefault()
+    const blockDefaultAndStop = (e: Event) => { e.preventDefault(); e.stopPropagation() }
+
+    container.addEventListener('wheel', onWheel, { passive: false })
+    container.addEventListener('mousedown', onMouseDown)
+    container.addEventListener('mouseup', onMouseUp)
+    container.addEventListener('mousemove', onMouseMove)
+    container.addEventListener('keydown', onKeyDown)
+    container.addEventListener('keyup', onKeyUp)
+    container.addEventListener('contextmenu', blockDefault)
+    container.addEventListener('dblclick', blockDefaultAndStop)
+    container.addEventListener('dragstart', blockDefault)
+    container.addEventListener('selectstart', blockDefault)
+
+    return () => {
+      container.removeEventListener('wheel', onWheel)
+      container.removeEventListener('mousedown', onMouseDown)
+      container.removeEventListener('mouseup', onMouseUp)
+      container.removeEventListener('mousemove', onMouseMove)
+      container.removeEventListener('keydown', onKeyDown)
+      container.removeEventListener('keyup', onKeyUp)
+      container.removeEventListener('contextmenu', blockDefault)
+      container.removeEventListener('dblclick', blockDefaultAndStop)
+      container.removeEventListener('dragstart', blockDefault)
+      container.removeEventListener('selectstart', blockDefault)
+    }
+  }, [sendInput])
+
+  // Auto-focus container on click for keyboard capture
+  const handleClick = useCallback(() => {
+    containerRef.current?.focus()
   }, [])
-
-  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const { x, y } = getRelativePos(e)
-    sendInputMessage('input.mouse_move', { x, y, display_id: 0 } satisfies MouseMovePayload)
-  }, [getRelativePos, sendInputMessage])
-
-  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const { x, y } = getRelativePos(e)
-    sendInputMessage('input.mouse_button', { button: e.button + 1, action: 'down', x, y } satisfies MouseButtonPayload)
-  }, [getRelativePos, sendInputMessage])
-
-  const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const { x, y } = getRelativePos(e)
-    sendInputMessage('input.mouse_button', { button: e.button + 1, action: 'up', x, y } satisfies MouseButtonPayload)
-  }, [getRelativePos, sendInputMessage])
-
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    const { x, y } = getRelativePos(e)
-    sendInputMessage('input.mouse_wheel', { delta_x: e.deltaX, delta_y: e.deltaY, x, y } satisfies MouseWheelPayload)
-  }, [getRelativePos, sendInputMessage])
-
-  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    sendInputMessage('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
-  }, [sendInputMessage])
-
-  const handleKeyUp = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    sendInputMessage('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
-  }, [sendInputMessage])
 
   return (
     <div
-      style={{ width: '100%', height: '100%', position: 'relative', outline: 'none' }}
-      onMouseMove={handleMouseMove}
-      onMouseDown={handleMouseDown}
-      onMouseUp={handleMouseUp}
-      onWheel={handleWheel}
-      onKeyDown={handleKeyDown}
-      onKeyUp={handleKeyUp}
+      ref={containerRef}
+      style={{ width: '100%', height: '100%', position: 'relative', outline: 'none', userSelect: 'none', cursor: 'none' }}
+      onClick={handleClick}
       tabIndex={0}
     >
       <video

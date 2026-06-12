@@ -9,11 +9,20 @@ import (
 	"syscall"
 
 	"github.com/evdi/agent/pkg/config"
-	"github.com/evdi/agent/pkg/display"
 	"github.com/evdi/agent/pkg/gstreamer"
 	"github.com/evdi/agent/pkg/input"
 	"github.com/evdi/agent/pkg/webrtc"
 )
+
+func init() {
+	// Reap zombie child processes from xdotool/mousemove etc.
+	// Without this, Start()'d processes accumulate as zombies and exhaust PID limits.
+	go func() {
+		for {
+			syscall.Wait4(-1, nil, 0, nil)
+		}
+	}()
+}
 
 func main() {
 	cfg := config.Load()
@@ -21,13 +30,12 @@ func main() {
 		cfg.WSPort, cfg.Display, cfg.VideoWidth, cfg.VideoHeight, cfg.VideoFPS,
 		cfg.WebRTCPortMin, cfg.WebRTCPortMax, cfg.NAT1To1IP)
 
-	// 1. 启动 Xvfb
-	xvfb := display.NewXvfb(cfg)
-	if err := xvfb.Start(); err != nil {
-		log.Fatalf("Failed to start Xvfb: %v", err)
+	// Xvfb is managed by entrypoint.sh — agent only uses the DISPLAY env var.
+	// Verify the display is accessible before proceeding.
+	if os.Getenv("DISPLAY") == "" {
+		log.Fatalf("DISPLAY env var not set — Xvfb must be started by entrypoint.sh")
 	}
-	defer xvfb.Stop()
-	log.Printf("Xvfb started on %s", cfg.Display)
+	log.Printf("Using display %s (started by entrypoint)", cfg.Display)
 
 	// Mouse move coalescing: only execute the latest position
 	mouseCh := make(chan webrtc.MouseMovePayload, 64)

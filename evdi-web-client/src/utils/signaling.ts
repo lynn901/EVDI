@@ -44,6 +44,10 @@ export class SignalingClient {
     }
   }
 
+  isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN
+  }
+
   disconnect(): void {
     this.onMessage = null
     this.ws?.close()

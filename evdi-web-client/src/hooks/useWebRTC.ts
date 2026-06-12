@@ -15,6 +15,7 @@ export function useWebRTC() {
     setMediaStream,
     setError,
     nextSeq,
+    setSendInputFn,
     reset,
   } = useConnectionStore()
 
@@ -32,9 +33,12 @@ export function useWebRTC() {
       // Merge all remote tracks into a single MediaStream.
       const combinedStream = new MediaStream()
       pc.ontrack = (event) => {
+        console.log('[WebRTC] ontrack:', event.track.kind, 'streams:', event.streams.length)
         combinedStream.addTrack(event.track)
+        const merged = new MediaStream(combinedStream.getTracks())
+        console.log('[WebRTC] merged stream tracks:', merged.getTracks().map(t => t.kind))
         // Create a new reference so Zustand detects the change
-        setMediaStream(new MediaStream(combinedStream.getTracks()))
+        setMediaStream(merged)
       }
 
       pc.onconnectionstatechange = () => {
@@ -66,6 +70,22 @@ export function useWebRTC() {
       const signaling = new SignalingClient()
       signalingRef.current = signaling
 
+      // Store sendInput function in Zustand so VideoCanvas can use it
+      setSendInputFn((msgType: string, payload: unknown) => {
+        if (signaling && signaling.isOpen()) {
+          signaling.send({
+            type: msgType as SignalingMessage['type'],
+            data: {
+              v: 1,
+              type: msgType,
+              ts: Date.now(),
+              seq: nextSeq(),
+              payload,
+            },
+          })
+        }
+      })
+
       // Wait for WebSocket to open before sending offer/ICE
       await signaling.connect(agentAddress, (msg: SignalingMessage) => {
         handleSignalingMessage(pc, msg, pendingICE)
@@ -93,7 +113,7 @@ export function useWebRTC() {
     } catch (err) {
       setError(`连接失败: ${err instanceof Error ? err.message : String(err)}`)
     }
-  }, [agentAddress, setConnectionState, setMediaStream, setError, nextSeq])
+  }, [agentAddress, setConnectionState, setMediaStream, setError, nextSeq, setSendInputFn])
 
   const disconnect = useCallback(() => {
     controlChannelRef.current?.close()
@@ -107,44 +127,7 @@ export function useWebRTC() {
     reset()
   }, [reset])
 
-  const sendInputMessage = useCallback((msgType: string, payload: unknown) => {
-    const signaling = signalingRef.current
-    if (!signaling) {
-      console.warn('[Input] No signaling connection')
-      return
-    }
-    signaling.send({
-      type: msgType as SignalingMessage['type'],
-      data: {
-        v: 1,
-        type: msgType,
-        ts: Date.now(),
-        seq: nextSeq(),
-        payload,
-      },
-    })
-  }, [nextSeq])
-
-  const sendDataChannelMessage = useCallback((channel: 'control' | 'bulk', msgType: string, payload: unknown) => {
-    const ch = channel === 'control' ? controlChannelRef.current : bulkChannelRef.current
-    if (!ch) {
-      console.warn('[DataChannel] No channel:', channel)
-      return
-    }
-    if (ch.readyState !== 'open') {
-      console.warn('[DataChannel] Channel not open:', channel, ch.readyState)
-      return
-    }
-    ch.send(JSON.stringify({
-      v: 1,
-      type: msgType,
-      ts: Date.now(),
-      seq: nextSeq(),
-      payload,
-    }))
-  }, [nextSeq])
-
-  return { connect, disconnect, sendDataChannelMessage, sendInputMessage }
+  return { connect, disconnect }
 }
 
 async function handleSignalingMessage(
