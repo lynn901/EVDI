@@ -432,7 +432,7 @@ gst-inspect-1.0 x264enc
 { "type": "input.mouse_move", "data": { "v":1, "type":"input.mouse_move", "ts":..., "seq":..., "payload": {"x":500,"y":300,"display_id":0} } }
 { "type": "input.mouse_button", "data": { "v":1, "type":"input.mouse_button", "ts":..., "seq":..., "payload": {"button":1,"action":"down","x":500,"y":300} } }
 { "type": "input.mouse_wheel", "data": { "v":1, "type":"input.mouse_wheel", "ts":..., "seq":..., "payload": {"delta_x":0,"delta_y":-120,"x":500,"y":300} } }
-{ "type": "input.key", "data": { "v":1, "type":"input.key", "ts":..., "seq":..., "payload": {"keycode":65,"action":"down","shift":false,"ctrl":false,"alt":false} } }
+{ "type": "input.key", "data": { "v":1, "type":"input.key", "ts":..., "seq":..., "payload": {"keycode":65,"action":"down","shift":false,"ctrl":false,"alt":false,"capsLock":false} } }
 ```
 
 ### 6.3 输入事件映射
@@ -440,10 +440,11 @@ gst-inspect-1.0 x264enc
 **浏览器 → Agent → X11** 全链路：
 
 ```
-浏览器 KeyboardEvent.keyCode
+浏览器 KeyboardEvent.keyCode + getModifierState('CapsLock')
   → WebSocket input.key 消息
     → Agent handleInputMessage()
-      → keyCodeToXKeySym() 转换
+      → syncCapsLockSync() 同步 X11 Caps Lock 状态
+      → keyCodeToXKeySym() 转换（字母键用小写 keysym）
         → xdotool key/mousedown/mouseup 执行
 ```
 
@@ -451,7 +452,7 @@ gst-inspect-1.0 x264enc
 
 | 浏览器 keyCode | X11 KeySym | 说明 |
 |----------------|-----------|------|
-| 65-90 | A-Z | 字母键 |
+| 65-90 | a-z | 字母键（**必须用小写 keysym**，见下方说明） |
 | 48-57 | 0-9 | 数字键 |
 | 13 | Return | 回车 |
 | 27 | Escape | ESC |
@@ -462,6 +463,10 @@ gst-inspect-1.0 x264enc
 | 37-40 | Left/Up/Right/Down | 方向键 |
 
 **修饰键处理**：使用 `xdotool key --clearmodifiers` 而非 `keydown`，避免 keysym 查找错误。
+
+**⚠️ 字母键必须用小写 keysym**：xdotool 对大写 keysym（如 `A`）会自动按 Shift 修饰键，Caps Lock ON 时 Shift+Caps Lock = 小写，导致大小写反转。正确做法是用小写 keysym（`a`-`z`），让 X11 根据 Caps Lock 状态自然决定大小写。
+
+**Caps Lock 状态同步**：客户端通过 `e.getModifierState('CapsLock')` 发送当前 Caps Lock 状态，Agent 在每次字母键按下前用 `syncCapsLockSync()`（同步 `.Run()`）确保 X11 的 Caps Lock 与客户端一致。不能用异步 `.Start()`，否则按键可能在 Caps Lock 切换完成前执行。
 
 ### 6.4 鼠标坐标映射
 

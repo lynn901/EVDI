@@ -3,17 +3,50 @@ package input
 import (
 	"fmt"
 	"os/exec"
+	"sync"
 )
 
+// capsLockMu protects the capsLockState variable.
+var capsLockMu sync.Mutex
+var capsLockState bool // tracks X11 Caps Lock state (assumed off at start)
+
+// syncCapsLockSync ensures X11's Caps Lock state matches the client's desired state.
+// This is SYNCHRONOUS — it waits for the toggle to complete before returning.
+func syncCapsLockSync(clientCapsLock bool) {
+	capsLockMu.Lock()
+	defer capsLockMu.Unlock()
+
+	if clientCapsLock != capsLockState {
+		exec.Command("xdotool", "key", "Caps_Lock").Run()
+		capsLockState = clientCapsLock
+	}
+}
+
 // KeyCmd builds an xdotool command for a key event.
-// Modifiers (shift/ctrl/alt) are sent as separate keydown/keyup events
-// to avoid xdotool's combined keysym parsing issues.
-func KeyCmd(keycode int, action string, shift, ctrl, alt bool) *exec.Cmd {
+func KeyCmd(keycode int, action string, shift, ctrl, alt, capsLock bool) *exec.Cmd {
 	keySym := keyCodeToXKeySym(keycode)
 
+	// For Caps Lock key itself, toggle our tracked state
+	if keycode == 20 {
+		if action == "down" {
+			capsLockMu.Lock()
+			capsLockState = !capsLockState
+			capsLockMu.Unlock()
+		}
+		if action == "down" {
+			return exec.Command("xdotool", "keydown", keySym)
+		}
+		return exec.Command("xdotool", "keyup", keySym)
+	}
+
+	// For letter keys (A-Z), synchronously sync Caps Lock before pressing.
+	// This must complete before the key command runs.
+	if keycode >= 65 && keycode <= 90 {
+		syncCapsLockSync(capsLock)
+	}
+
 	if action == "down" {
-		// For keydown with modifiers, use xdotool key --delay 0 which handles
-		// the press sequence correctly (modifiers first, then key)
+		// For keydown with modifiers, use xdotool key --delay 0
 		if shift || ctrl || alt {
 			args := []string{"key", "--delay", "0", "--clearmodifiers"}
 			if ctrl {
@@ -34,10 +67,15 @@ func KeyCmd(keycode int, action string, shift, ctrl, alt bool) *exec.Cmd {
 
 // keyCodeToXKeySym maps browser e.keyCode values to X11 KeySym names.
 // Browser keyCode values follow the DOM Level 3 / Windows Virtual Key Code standard.
+//
+// IMPORTANT for letter keys: we use LOWERCASE keysyms (a-z), not uppercase.
+// xdotool automatically adds Shift for uppercase keysyms like "A", which means
+// Caps Lock ON + Shift = lowercase — the opposite of what the user expects.
+// Using lowercase keysyms lets X11 handle case based on Caps Lock state.
 func keyCodeToXKeySym(keycode int) string {
-	// Letters: A=65 ... Z=90
+	// Letters: A=65 ... Z=90 → lowercase keysym a-z
 	if keycode >= 65 && keycode <= 90 {
-		return fmt.Sprintf("%c", keycode)
+		return fmt.Sprintf("%c", keycode+32)
 	}
 	// Digits: 0=48 ... 9=57
 	if keycode >= 48 && keycode <= 57 {

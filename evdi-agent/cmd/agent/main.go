@@ -135,8 +135,8 @@ func handleInputMessage(msg webrtc.DataChannelMessage, mouseCh chan<- webrtc.Mou
 	case "input.key":
 		var p webrtc.KeyPayload
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			log.Printf("[Input] key: keycode=%d action=%s shift=%v ctrl=%v alt=%v", p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt)
-			input.KeyCmd(p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt).Start()
+			log.Printf("[Input] key: keycode=%d action=%s shift=%v ctrl=%v alt=%v capsLock=%v", p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt, p.CapsLock)
+			input.KeyCmd(p.Keycode, p.Action, p.Shift, p.Ctrl, p.Alt, p.CapsLock).Start()
 		}
 	case "clipboard.push":
 		log.Printf("Clipboard push received (MVP: no-op)")

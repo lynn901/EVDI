@@ -50,6 +50,7 @@ export interface KeyPayload {
   shift: boolean
   ctrl: boolean
   alt: boolean
+  capsLock: boolean
 }
 
 export interface ClipboardPayload {

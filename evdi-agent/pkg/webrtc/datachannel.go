@@ -36,11 +36,12 @@ type MouseWheelPayload struct {
 
 // KeyPayload represents a keyboard key event.
 type KeyPayload struct {
-	Keycode int    `json:"keycode"`
-	Action  string `json:"action"`
-	Shift   bool   `json:"shift"`
-	Ctrl    bool   `json:"ctrl"`
-	Alt     bool   `json:"alt"`
+	Keycode  int    `json:"keycode"`
+	Action   string `json:"action"`
+	Shift    bool   `json:"shift"`
+	Ctrl     bool   `json:"ctrl"`
+	Alt      bool   `json:"alt"`
+	CapsLock bool   `json:"capsLock"`
 }
 
 // ClipboardPayload represents clipboard data transfer.

@@ -63,13 +63,13 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
     const onKeyDown = (e: KeyboardEvent) => {
       e.preventDefault()
       e.stopPropagation()
-      sendInput('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+      sendInput('input.key', { keycode: e.keyCode, action: 'down', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, capsLock: e.getModifierState('CapsLock') } satisfies KeyPayload)
     }
 
     const onKeyUp = (e: KeyboardEvent) => {
       e.preventDefault()
       e.stopPropagation()
-      sendInput('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey } satisfies KeyPayload)
+      sendInput('input.key', { keycode: e.keyCode, action: 'up', shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, capsLock: e.getModifierState('CapsLock') } satisfies KeyPayload)
     }
 
     // Block all browser default behaviors that interfere with remote desktop

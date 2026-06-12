@@ -447,6 +447,87 @@ func init() {
 style={{ cursor: 'none' }}
 ```
 
+### 5.13 容器重启后服务无法自动恢复
+
+**现象**：容器重启后 Agent、Xvfb、桌面环境等所有服务无法正常启动，客户端无法连接。
+
+**根因**（三个层面）：
+
+1. **Agent 与 entrypoint.sh 双重启动 Xvfb**：entrypoint.sh 已在后台启动 Xvfb，但 Agent 的 `main.go` 又调用 `xvfb.Start()` 尝试在同一 display 上启动第二个 Xvfb，导致 `log.Fatalf` 退出，容器停止。
+
+2. **残留 X lock 文件**：容器重启时旧 Xvfb 进程被杀但 `/tmp/.X{N}-lock` 文件残留，新 Xvfb 检测到 lock 文件后拒绝启动（`Server is already active for display`）。
+
+3. **无进程管理 + 无重启策略**：后台服务（Xvfb、PulseAudio、桌面）崩溃后无人重启；容器退出后没有 restart 策略自动恢复。
+
+**修复**：
+
+1. **Agent 不再启动 Xvfb**：删除 `main.go` 中的 `xvfb.Start()`/`xvfb.Stop()` 调用，改为仅检查 `DISPLAY` 环境变量是否已设置。
+
+2. **entrypoint.sh 增加 lock 文件清理**：启动 Xvfb 前自动删除残留的 `/tmp/.X{N}-lock`。
+
+3. **supervise 进程管理**：entrypoint.sh 中每个后台服务由 `supervise` 函数包裹，崩溃后 2 秒自动重启。
+
+4. **容器 restart 策略**：`--restart unless-stopped`，Agent 退出（PID 1 死亡）→ 容器重启 → entrypoint.sh 从头执行。
+
+5. **就绪检查**：Xvfb 就绪检查使用 `xdotool getdisplaygeometry`（已安装），而非 `xdpyinfo`（未安装）。
+
+### 5.14 `--network host` 下 X display 冲突
+
+**现象**：容器使用 `--network host` 时 Xvfb 报 `Cannot establish any listening sockets`，bridge 模式下端口映射不通。
+
+**根因**：
+
+- `--network host` 模式共享宿主机的网络命名空间，包括 abstract Unix socket。如果宿主机已运行 Xvfb :99（占用了 `@/tmp/.X11-unix/X99` socket），容器内 Xvfb 无法绑定同一 socket。
+- Bridge 模式下 Podman 的端口映射在 WSL2 环境中不生效（`curl` 报 `No route to host`）。
+
+**修复**：
+
+1. 使用 `--network host` 模式（解决 bridge 端口映射问题）。
+2. 确保宿主机无同编号 X display 残留进程（检查 `pgrep -a Xvfb` 和 `/tmp/.X*-lock`，如有则 `kill` + `rm`）。
+3. 客户端 Agent 地址从硬编码 IP 改为 `` ws://${window.location.hostname}:8080/ws ``，自动适配。
+
+### 5.15 GNOME 桌面在容器中无法启动
+
+**现象**：`ubuntu-desktop`（GNOME）在容器中启动崩溃，报 `Error calling StartServiceByName for org.freedesktop.login1`。
+
+**根因**：GNOME Shell 强依赖 `systemd-logind`（`org.freedesktop.login1` D-Bus 服务），容器内没有 systemd 作为 PID 1，无法提供该服务。
+
+**解决**：改用 XFCE 桌面（无 systemd 依赖），配合 Ubuntu 24.04 基础镜像。新增 `Dockerfile.ubuntu` + `entrypoint-ubuntu.sh`，保留原 Debian XFCE 方案不动。
+
+### 5.16 Caps Lock 大小写反转
+
+**现象**：客户端 Caps Lock 关闭时云桌面输出大写，Caps Lock 开启时输出小写——始终反转。
+
+**根因**：`keyCodeToXKeySym` 将浏览器 keycode 65 映射为大写 keysym `"A"`。xdotool 对大写 keysym 会**自动按住 Shift 修饰键**以产生大写字母。但 Caps Lock ON 时，**Shift + Caps Lock = 小写**，导致输出反转。
+
+通过 `xev` 抓取 X11 键盘事件验证：
+
+```
+xdotool key A（Caps Lock OFF）:
+  KeyPress   Shift_L + keycode 38 (keysym A)   ← xdotool 自动加了 Shift
+  → 产生 'A' ✓
+
+xdotool key A（Caps Lock ON）:
+  KeyPress   Shift_L + keycode 38 (keysym a)   ← Shift + Caps Lock = 小写！
+  → 产生 'a' ✗ 反转！
+```
+
+**修复**：字母键使用**小写 keysym**（`a`-`z`），让 X11 根据自身 Caps Lock 状态自然决定大小写：
+
+```go
+// 旧：return fmt.Sprintf("%c", keycode)       // 65 → "A"
+// 新：return fmt.Sprintf("%c", keycode+32)     // 65 → "a"
+```
+
+验证小写 keysym 行为正确：
+
+```
+xdotool key a（Caps Lock OFF）→ keysym 'a' → 输出 'a' ✓
+xdotool key a（Caps Lock ON） → keysym 'a' → 输出 'A' ✓（X11 自动大写）
+```
+
+同时修复了 Caps Lock 状态同步：客户端发送 `capsLock: e.getModifierState('CapsLock')`，Agent 在每次字母键按下前用 `syncCapsLockSync()`（同步执行 `.Run()`）确保 X11 的 Caps Lock 状态与客户端一致。
+
 ---
 
 ## 六、关键经验总结
@@ -490,8 +571,23 @@ style={{ cursor: 'none' }}
 | 非阻塞执行 | `exec.Command.Start()` 优于 `Run()`，避免阻塞消息处理循环 |
 | 去掉 --sync | xdotool 的 `--sync` 在高频场景下造成严重延迟 |
 | KeyCode 体系 | 浏览器 `e.keyCode` 是 Windows Virtual Key Code（A=65），不是 USB HID Code（A=4） |
+| xdotool keysym 大小写 | **字母键必须用小写 keysym**（`a`-`z`），不能用大写（`A`-`Z`）。大写 keysym 会触发 xdotool 自动按 Shift，与 Caps Lock 叠加导致反转 |
+| Caps Lock 同步 | 客户端发送 `capsLock` 状态，Agent 同步 X11 的 Caps Lock 状态。同步必须用 `.Run()`（阻塞），不能用 `.Start()`（异步），否则竞态导致按键在 Caps Lock 切换前执行 |
 | 修饰键 | `xdotool keydown "ctrl+A"` 不等于"按住ctrl按A"，用 `xdotool key --clearmodifiers ctrl+A` |
 | Zombie 回收 | `exec.Command.Start()` 启动的进程必须有人 wait，否则变成 zombie。用 `syscall.Wait4(-1, ...)` goroutine 回收 |
+
+### 6.5 容器运行与部署要点
+
+| 要点 | 说明 |
+|------|------|
+| Xvfb 单一管理 | Xvfb 只能由 entrypoint.sh 启动，Agent 不再重复启动，避免 display 冲突 |
+| Lock 文件清理 | 容器重启前 Xvfb 不会优雅退出，`/tmp/.X{N}-lock` 残留会阻止新实例启动，entrypoint 需主动清理 |
+| supervise 进程管理 | 后台服务（Xvfb、PulseAudio、桌面）必须由 supervise 包裹，崩溃后自动重启 |
+| restart 策略 | `--restart unless-stopped` 确保容器级恢复；Agent 作为 PID 1（`exec agent`），退出即触发容器重启 |
+| `--network host` | WSL2 + Podman 下 bridge 模式端口映射可能不通，`--network host` 更可靠。但需确保宿主机无同编号 X display 残留 |
+| GNOME 不兼容容器 | GNOME Shell 强依赖 systemd-logind，普通容器无法运行。XFCE/KDE 无此限制 |
+| 就绪检查 | 用 `xdotool getdisplaygeometry` 检查 Xvfb 就绪（`xdpyinfo` 可能未安装） |
+| 客户端地址 | 使用 `` ws://${window.location.hostname}:8080/ws `` 自动适配，不硬编码 IP |
 
 ---
 
@@ -546,7 +642,9 @@ style={{ cursor: 'none' }}
 | 优先级 | 事项 | 说明 |
 |--------|------|------|
 | P1 | 音频流测试 | 当前 Pipeline 只实现了视频，PulseAudio → Opus 通路待验证 |
-| ~~P1~~ | ~~容器入口脚本优化~~ | ~~Agent 的 `xvfb.Start()` 可能与入口脚本冲突，需统一 Xvfb/XFCE 启动逻辑~~ **已解决**：Agent 不再启动 Xvfb，由 entrypoint.sh 统一管理，supervise 自动恢复，见 `docs/mvp/mvp-dev-debug-guide.md` |
+| ~~P1~~ | ~~容器入口脚本优化~~ | **已解决**：Agent 不再启动 Xvfb，entrypoint.sh 统一管理 + supervise 自动恢复 |
+| ~~P1~~ | ~~客户端连接问题~~ | **已解决**：`--network host` + 清理宿主机残留 Xvfb + 客户端地址自适应 |
+| ~~P1~~ | ~~Caps Lock 大小写反转~~ | **已解决**：字母键用小写 keysym + Caps Lock 状态同步 |
 | P2 | DataChannel 双向修复 | 升级 Pion 或调整 ICE 配置，恢复 DataChannel 双向通信 |
 | P2 | 生产镜像构建 | 优化 Dockerfile 多阶段构建，减小镜像体积 |
 | P2 | 断线重连 | WebSocket/WebRTC 断线后的自动重连机制 |
