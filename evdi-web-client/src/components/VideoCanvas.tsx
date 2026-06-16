@@ -15,8 +15,15 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
     const video = videoRef.current
     if (video && stream) {
       video.srcObject = stream
+      // Explicitly unmute — Chrome autoplay policy may auto-mute the <video> element.
+      // Without this, WebRTC audio tracks play silently even though they are received.
+      video.muted = false
       video.play().catch((err) => {
-        if (err.name !== 'AbortError') console.warn('[VideoCanvas] play() failed:', err)
+        // NotAllowedError: browser blocked autoplay (user hasn't interacted yet).
+        // Will retry on first user click via handleClick.
+        if (err.name !== 'AbortError' && err.name !== 'NotAllowedError') {
+          console.warn('[VideoCanvas] play() failed:', err)
+        }
       })
     }
   }, [stream])
@@ -124,9 +131,21 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
     }
   }, [sendInput])
 
-  // Auto-focus container on click for keyboard capture
+  // Auto-focus container on click for keyboard capture;
+  // also retry play() in case autoplay was blocked by browser policy.
   const handleClick = useCallback(() => {
     containerRef.current?.focus()
+    const video = videoRef.current
+    if (video) {
+      // Force unmute — Chrome may auto-mute the <video> element due to autoplay policy
+      if (video.muted) {
+        console.warn('[VideoCanvas] video.muted was true, forcing unmute')
+        video.muted = false
+      }
+      if (video.paused) {
+        video.play().catch(() => {})
+      }
+    }
   }, [])
 
   return (
@@ -140,7 +159,6 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
         ref={videoRef}
         autoPlay
         playsInline
-        muted
         style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
       />
     </div>

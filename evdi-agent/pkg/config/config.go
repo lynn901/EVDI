@@ -14,6 +14,7 @@ type Config struct {
 	WebRTCPortMin uint16
 	WebRTCPortMax uint16
 	NAT1To1IP     string
+	PulseServer   string
 }
 
 func Load() *Config {
@@ -26,6 +27,7 @@ func Load() *Config {
 		WebRTCPortMin: uint16(getEnvInt("WEBRTC_PORT_MIN", 50000)),
 		WebRTCPortMax: uint16(getEnvInt("WEBRTC_PORT_MAX", 50100)),
 		NAT1To1IP:     getEnv("NAT_1TO1_IP", ""),
+		PulseServer:   getEnv("PULSE_SERVER", ""),
 	}
 }
 

@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-x gstreamer1.0-libav \
+    libopus-dev libopusfile-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,6 +16,7 @@ ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+RUN go mod tidy
 RUN CGO_ENABLED=1 go build -o /agent ./cmd/agent
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
@@ -135,6 +137,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
         libgstreamer-plugins-bad1.0-0 \
         # ── Audio / multimedia ──
         libopus0 \
+        libopusfile0 \
         libvpx-dev \
         x264 \
         x265 \
