@@ -1,7 +1,8 @@
 # Agent 架构设计
 
-> **文档版本**: v1.0
+> **文档版本**: v1.1
 > **创建日期**: 2026-06-05
+> **最后更新**: 2026-06-16（MVP 验证后更新）
 > **状态**: 草稿
 
 ## 目录
@@ -13,6 +14,7 @@
 5. [安全设计](#5-安全设计)
 6. [部署与运维](#6-部署与运维)
 7. [接口规范](#7-接口规范)
+8. [MVP 验证记录](#8-mvp-验证记录)
 
 ---
 
@@ -20,15 +22,35 @@
 
 ### 1.1 Agent 定位
 
-[待填写]
+Agent 是 EVDI 七层架构中 **L2 层（媒体与接入层）** 的核心组件，运行在桌面实例（Linux Pod / Windows VM）内部，承担媒体流编码与传输、输入事件处理、会话管理三大核心职责。
+
+参考 Citrix VDA（Virtual Delivery Agent）架构，Agent 遵循最小化外部交互原则——仅与 Client（入站 WebRTC）和 Broker（出站 gRPC/REST）通信，不直接暴露管理端口，不直接操作 K8s API。
+
+MVP 阶段已验证 Agent 在 Linux 容器（Podman/Docker）内的完整工作链路：浏览器通过 WebRTC 接收 H.264 视频流 + Opus 音频流，鼠标键盘输入通过 WebSocket 信令通道实时传输，xdotool 执行输入命令，桌面画面与输入交互均正常工作。
 
 ### 1.2 设计目标
 
-[待填写]
+| 目标 | 说明 |
+|------|------|
+| 低延迟媒体传输 | 基于 WebRTC（Pion）+ H.264/Opus，局域网端到端延迟目标 < 100ms |
+| 硬件编码自适应 | 自动检测 GPU 类型（NVIDIA NVENC → Intel/AMD VAAPI → x264 软编码），按最优路径编码 |
+| 跨平台输入处理 | 统一接收 Client 输入事件，转换为操作系统原生输入（Linux: xdotool/XTest, Windows: SendInput） |
+| 进程隔离合规 | GStreamer（LGPL）作为独立进程运行，通过管道与 Agent 通信，满足 LGPL 合规要求 |
+| 容器化优先 | 以容器为交付单元，包含 Xvfb + 桌面环境 + Agent，一键启动即可提供远程桌面服务 |
+| Broker 解耦 | Agent 不直接操作 K8s API，所有业务编排通过 Broker 完成，Agent 只负责执行 |
 
 ### 1.3 核心职责
 
-[待填写]
+Agent 的核心职责划分为以下六个领域：
+
+| 职责 | 说明 | MVP 状态 |
+|------|------|---------|
+| **媒体编码与传输** | GStreamer 采集桌面画面 + 系统音频，编码后通过 Pion WebRTC 推送给 Client | ✅ 视频已验证，音频待验证 |
+| **输入事件处理** | 接收 Client 键鼠事件，转换为操作系统输入指令 | ✅ 已验证（xdotool 方案） |
+| **WebRTC 信令** | SDP/ICE 交换，建立 PeerConnection | ✅ 已验证（Agent 内建 WebSocket 信令） |
+| **会话管理** | 连接生命周期管理、断线重连、状态上报 | ⏳ MVP 简化版，正式版接入 Broker |
+| **Broker 通信** | gRPC/REST 心跳上报、配置拉取、指令接收 | ⏳ MVP 未实现，正式版实现 |
+| **监控采集** | CPU/内存/磁盘/网络指标采集并上报 | ⏳ MVP 未实现，正式版实现 |
 
 ---
 
@@ -361,6 +383,10 @@ iceConfig := webrtc.Configuration{
 
 #### 3.1.4 SDP 协商流程
 
+> **⚠️ MVP 验证结果**：以下流程描述的是正式架构中 Agent 发起 Offer 的设计。MVP 实测发现，浏览器端 `RTCPeerConnection` 在 Client 发起 Offer、Agent 回复 Answer 的模式下工作更可靠（这也是 WebRTC 的标准模式——由浏览器侧发起 Offer）。正式版本将统一修正为 Client 发 Offer、Agent 回 Answer 的流程，下方 §3.1.4-A 已补充 MVP 实际验证的协商流程。
+
+**正式架构设计（Agent 发起 Offer）：**
+
 ```
 ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
 │   Client    │          │   Broker    │          │    Agent    │
@@ -425,7 +451,66 @@ func (e *WebRTCEngine) SetRemoteAnswer(answer webrtc.SessionDescription) error {
 }
 ```
 
+**§3.1.4-A MVP 实际验证的协商流程（Client 发起 Offer）：**
+
+MVP 阶段验证通过的流程如下，由 Client（浏览器）发起 Offer，Agent 回复 Answer：
+
+```
+┌─────────────┐                         ┌─────────────┐
+│   Client    │                         │    Agent    │
+│  (Full ICE) │                         │  (Lite ICE) │
+└──────┬──────┘                         └──────┬──────┘
+       │                                       │
+       │  1. WebSocket 连接 (/ws)              │
+       │──────────────────────────────────────►│
+       │                                       │
+       │  2. SDP Offer (via WS)                │
+       │──────────────────────────────────────►│
+       │                                       │  3. SetRemoteDescription(Offer)
+       │                                       │  4. CreateAnswer
+       │                                       │  5. SetLocalDescription(Answer)
+       │  6. SDP Answer (via WS)               │
+       │◄──────────────────────────────────────│
+       │                                       │
+       │  7. ICE Candidate (via WS)            │
+       │──────────────────────────────────────►│  8. AddICECandidate
+       │  9. ICE Candidate (via WS)            │
+       │◄──────────────────────────────────────│  10. ICE Candidate 转发
+       │                                       │
+       │  11. DTLS 握手完成                     │
+       │◄═══════════════════════════════════════│
+       │  12. 连接建立                          │
+       │                                       │
+```
+
+**MVP 实现代码（Agent 端 HandleOffer）：**
+
+```go
+// Agent 端：接收 Offer，返回 Answer
+func (e *WebRTCEngine) HandleOffer(offerData json.RawMessage) (json.RawMessage, error) {
+    var offer webrtc.SessionDescription
+    if err := json.Unmarshal(offerData, &offer); err != nil {
+        return nil, fmt.Errorf("unmarshal offer: %w", err)
+    }
+    if err := e.peerConnection.SetRemoteDescription(offer); err != nil {
+        return nil, fmt.Errorf("set remote description: %w", err)
+    }
+    answer, err := e.peerConnection.CreateAnswer(nil)
+    if err != nil {
+        return nil, fmt.Errorf("create answer: %w", err)
+    }
+    if err := e.peerConnection.SetLocalDescription(answer); err != nil {
+        return nil, fmt.Errorf("set local description: %w", err)
+    }
+    return json.Marshal(answer)
+}
+```
+
+> **设计修正说明**：正式架构中将统一采用 Client 发 Offer、Agent 回 Answer 的模式，与 WebRTC 浏览器标准行为一致。原设计中 Agent 发 Offer 的流程不再保留。
+
 #### 3.1.5 DataChannel 管理
+
+> **⚠️ MVP 验证结果**：Pion WebRTC v4 Lite ICE 模式下，SCTP DataChannel 存在单向性问题——Agent→浏览器方向正常（浏览器可收到 `ctrl.ping`），但浏览器→Agent 方向失败（Agent 收不到任何消息）。MVP 阶段已改用 WebSocket 信令通道传输输入事件作为临时方案（详见 §3.3.6 加注）。正式版本需升级 Pion 或调整 ICE 配置修复 DataChannel 双向通信，使输入事件回归 DataChannel 传输。
 
 **DataChannel 创建：**
 
@@ -542,6 +627,8 @@ func (e *WebRTCEngine) handleMessage(jsonMsg string) error {
 ```
 
 #### 3.1.6 媒体流管理
+
+> **⚠️ MVP 验证结果**：Pion 为 video 和 audio 轨道分别创建不同的 MSID，导致浏览器端 `ontrack` 触发两次，每次的 `event.streams[0]` 是不同的 MediaStream 对象。如果直接赋值 `video.srcObject = event.streams[0]`，音频流会覆盖视频流导致黑屏。**Client 端必须将所有 track 合并到同一个 MediaStream 中**（详见 Client 文档 §6.4）。此外，MVP 实测中自定义 MediaEngine 只注册 H.264（payload 96）+ Opus（payload 111）是必要的，否则浏览器 SDP 协商会优先选择 VP8。
 
 **视频轨创建：**
 
@@ -780,6 +867,8 @@ func NewGStreamerPipeline(gpuType GPUType, config *EncodingConfig) (*GStreamerPi
 
 **GStreamer Pipeline 配置：**
 
+> **⚠️ MVP 验证结果**：以下 Pipeline 使用 `appsink` + `rtph264pay` 的方式在 MVP 中未采用。MVP 实际使用 **`fdsink fd=1` 进程隔离方案**——GStreamer 作为独立子进程运行，通过 stdout 管道输出 H.264 字节流，Agent 主进程从管道读取后自行解析 NALU 并调用 Pion `WriteSample` 发送。这种方式满足 LGPL 合规要求（进程隔离 + 动态链接），且 Pipeline 崩溃不会影响 Agent 主进程。MVP 实际的 x264 Pipeline 见下方 §3.1.8-A。
+
 ```go
 // NVIDIA NVENC Pipeline
 func newNVIDIAH264Pipeline(config *EncodingConfig) (*GStreamerPipeline, error) {
@@ -823,6 +912,39 @@ func newX264Pipeline(config *EncodingConfig) (*GStreamerPipeline, error) {
     return newPipelineFromString(pipelineStr)
 }
 ```
+
+**§3.1.8-A MVP 实际验证的 x264 Pipeline（进程隔离方案）：**
+
+MVP 采用 GStreamer 子进程 + stdout 管道的方式，Agent 主进程解析 NALU 并调用 Pion `WriteSample`：
+
+```
+ximagesrc display-name=:99 use-damage=false show-pointer=true
+  startx=0 starty=0 endx=1919 endy=1079 !
+video/x-raw,framerate=30/1 !
+videoconvert !
+video/x-raw,format=I420 !
+x264enc tune=zerolatency speed-preset=ultrafast byte-stream=true threads=1 !
+video/x-h264,stream-format=byte-stream,profile=constrained-baseline !
+fdsink fd=1 sync=false
+```
+
+**MVP Pipeline 关键参数踩坑记录：**
+
+| 参数 | 说明 |
+|------|------|
+| `show-pointer=true` | 捕获 X 光标（不是 `show-cursor`，后者不存在于 ximagesrc），依赖 XFixes 扩展 |
+| `endx/endy` | 值为 `width-1 / height-1`，不是 `width/height` |
+| `format=I420` | x264enc 前必须强制 I420 输入格式，否则默认可能输出 High 4:4:4 profile |
+| `profile=constrained-baseline` | 用 caps filter 指定，不能通过 x264enc 属性设置（x264enc 无 profile 属性） |
+| `byte-stream=true` | Pion 需要字节流格式（Annex B），不是 AVCC 格式 |
+| `threads=1` | 容器内 x264enc 多线程初始化可能失败，需添加 `threads=1` |
+| `fdsink fd=1` | 输出到 stdout，由 Agent 管道读取。满足 LGPL 进程隔离合规 |
+
+**MVP NALU 解析要点：**
+
+- 必须同时支持 3 字节（`00 00 01`）和 4 字节（`00 00 00 01`）起始码，x264enc 两种都会输出
+- 以 AUD（NALU type=9）为界缓冲 NALU，在遇到下一个 AUD 时将缓冲区作为一个 Access Unit（AU）整体调用 `WriteSample` 发送
+- 逐个 NALU 单独发送 WriteSample 会导致花屏——浏览器需要完整的 AU
 
 #### 3.1.9 连接状态监控
 
@@ -3398,6 +3520,25 @@ func (m *SessionManager) validateToken(tokenString string) (*TokenClaims, error)
 ```
 
 #### 3.3.6 输入事件处理
+
+> **⚠️ MVP 验证结果**：MVP 阶段使用 **xdotool 命令行工具**（通过 `os/exec` 调用）作为输入注入方案，而非正式架构的 XTest CGo 直接调用。此外，由于 Pion Lite ICE DataChannel 单向问题（见 §3.1.5 加注），MVP 中输入事件通过 **WebSocket 信令通道** 传输而非 DataChannel。两者均为临时方案，正式版本规划如下：
+>
+> | 维度 | MVP 临时方案 | 正式架构方案 |
+> |------|------------|------------|
+> | 输入传输通道 | WebSocket 信令通道 | WebRTC DataChannel（control 通道） |
+> | 输入注入方式 | xdotool（`exec.Command`） | XTest 扩展（CGo 直接调用） |
+> | 输入事件来源 | WebSocket `default` 分支 | DataChannel `OnMessage` 回调 |
+>
+> **MVP 输入处理关键经验（xdotool 方案）：**
+>
+> 1. **字母键必须用小写 keysym**：xdotool 对大写 keysym（如 `A`）会自动按 Shift 修饰键，Caps Lock ON 时 Shift+Caps Lock = 小写，导致大小写反转。正确做法是用小写 keysym（`a`-`z`），让 X11 根据 Caps Lock 状态自然决定大小写
+> 2. **Caps Lock 状态同步**：客户端发送 `capsLock` 状态，Agent 在每次字母键按下前用同步 `.Run()` 确保 X11 的 Caps Lock 与客户端一致。不能用异步 `.Start()`，否则按键可能在 Caps Lock 切换完成前执行
+> 3. **鼠标位置合并（coalescing）**：鼠标移动事件高频，通过 channel + drain 策略，只执行最新位置，丢弃中间帧
+> 4. **非阻塞执行**：`exec.Command.Start()` 优于 `Run()`，避免阻塞消息处理循环
+> 5. **去掉 `--sync`**：xdotool 的 `--sync` 在高频场景下造成严重延迟
+> 6. **修饰键处理**：`xdotool keydown "ctrl+A"` 不等于"按住 ctrl 按 A"，应使用 `xdotool key --clearmodifiers ctrl+A`
+> 7. **KeyCode 体系**：浏览器 `e.keyCode` 是 Windows Virtual Key Code（A=65），不是 USB HID Code（A=4）
+> 8. **Zombie 进程回收**：`exec.Command.Start()` 启动的进程必须有人 wait，否则变成 zombie。用 `syscall.Wait4(-1, ...)` goroutine 回收
 
 **输入事件架构：**
 
@@ -11732,3 +11873,131 @@ func (c *BrokerClient) logError(operation string, err error, resp *http.Response
     log.Printf("Error: %+v", logEntry)
 }
 ```
+
+---
+
+## 8. MVP 验证记录
+
+> 本章记录 MVP 阶段的验证结果、与正式架构的偏差、以及调试过程中发现的关键经验。完整调试过程详见 `docs/mvp/2026-06-11-mvp-debug-record.md`。
+
+### 8.1 MVP 验证范围与结果
+
+| 验证项 | 状态 | 说明 |
+|--------|------|------|
+| WebSocket 信令建立 | ✅ 通过 | Agent 内建 WebSocket 服务 (:8080/ws)，CORS 允许所有来源 |
+| SDP Offer/Answer 交换 | ✅ 通过 | Client 发 Offer，Agent 回 Answer（与原设计方向相反） |
+| ICE 候选交换 | ✅ 通过 | Trickle ICE，候选逐条通过 WebSocket 转发 |
+| H.264 视频流传输 | ✅ 通过 | x264enc constrained-baseline，30 FPS |
+| Opus 音频流 | ⏳ 待验证 | Pipeline 已配置，音频通路待完整测试 |
+| 鼠标移动 | ✅ 通过 | WebSocket 信令通道 + xdotool，带位置合并 |
+| 鼠标按键 | ✅ 通过 | 左/右/中键，up/down 事件 |
+| 滚轮 | ✅ 通过 | 上下滚动 |
+| 键盘输入 | ✅ 通过 | 字母、数字、功能键、修饰键，含 Caps Lock 同步 |
+| 剪贴板同步 | ⏳ MVP no-op | 消息格式已定义，功能未实现 |
+| 分辨率调整 | ⏳ MVP no-op | 消息格式已定义，功能未实现 |
+| DataChannel 双向 | ❌ 失败 | Pion Lite ICE 下 SCTP 单向，已改用 WebSocket |
+
+### 8.2 MVP 与正式架构的偏差汇总
+
+| 偏差项 | 正式架构设计 | MVP 实际实现 | 修正方向 |
+|--------|------------|------------|---------|
+| SDP 协商方向 | Agent 发 Offer | Client 发 Offer，Agent 回 Answer | 正式版统一为 Client 发 Offer |
+| 输入事件传输 | DataChannel (control) | WebSocket 信令通道 | 修复 Pion DataChannel 后回归 DataChannel |
+| 输入注入方式 | XTest CGo 直接调用 | xdotool (`exec.Command`) | 正式版迁移至 XTest CGo |
+| GStreamer 输出 | appsink + rtph264pay | fdsink fd=1 + Agent 解析 NALU | 评估正式版是否沿用进程隔离方案 |
+| 信令服务 | Broker Gateway Service | Agent 内建 WebSocket | 正式版接入 Broker Gateway |
+| 认证 | JWT + Session Token | 无认证（CORS 全开放） | 正式版接入 Broker 认证 |
+| 进程管理 | 生命周期管理模块 | supervisord / entrypoint.sh supervise | 正式版增强，K8s 原生管理 |
+| 音频系统 | PulseAudio | PipeWire + WirePlumber | 正式版沿用 PipeWire 方案 |
+
+### 8.3 MVP 调试关键经验
+
+#### 8.3.1 Pion WebRTC Lite ICE 注意事项
+
+| 问题 | 说明 |
+|------|------|
+| SCTP DataChannel 单向 | Lite ICE 模式下 Agent→浏览器方向正常，浏览器→Agent 方向可能失败 |
+| MediaEngine 自定义 | 必须自定义 MediaEngine 只注册目标编解码器（H.264 + Opus），否则浏览器可能协商到 VP8 |
+| ontrack MSID 合并 | Pion 为 video/audio 创建不同 MSID，Client 必须合并到同一个 MediaStream |
+| NAT 1:1 IP | 跨网段时需设置 `NAT_1TO1_IP`，否则 ICE 候选者中的 IP 不可达 |
+
+#### 8.3.2 GStreamer Pipeline 要点
+
+| 要点 | 说明 |
+|------|------|
+| x264enc profile | 不能通过属性设置，必须用 caps filter 指定 `profile=constrained-baseline` |
+| 输入格式 | x264enc 前必须强制 I420 格式（`videoconvert ! video/x-raw,format=I420 !`） |
+| 光标捕获 | `ximagesrc show-pointer=true`（不是 show-cursor），需要 XFixes 扩展 |
+| NALU 解析 | 必须同时支持 3 字节和 4 字节起始码，以 AUD 为界组 AU |
+| 进程隔离 | GStreamer 作为独立进程运行（`fdsink fd=1`），满足 LGPL 合规要求 |
+| 多线程问题 | 容器内 x264enc 多线程初始化可能失败，添加 `threads=1` |
+
+#### 8.3.3 容器运行与部署要点
+
+| 要点 | 说明 |
+|------|------|
+| Xvfb 单一管理 | Xvfb 只能由 entrypoint.sh / supervisord 启动，Agent 不再重复启动 |
+| Lock 文件清理 | 容器重启前 Xvfb 不会优雅退出，`/tmp/.X{N}-lock` 残留需主动清理 |
+| 进程管理 | supervisord 管理所有子进程，崩溃后自动重启（`autorestart=true`） |
+| `--network host` | WSL2 + Podman 下 bridge 模式端口映射可能不通，`--network host` 更可靠 |
+| GNOME 不兼容容器 | GNOME Shell 强依赖 systemd-logind，容器内无法运行。XFCE/KDE 无此限制 |
+| PipeWire 替代 PulseAudio | PipeWire + WirePlumber + pipewire-pulse 替代 PulseAudio，权限问题更少 |
+| 虚拟显示扩展 | Xvfb 需启用 COMPOSITE/DAMAGE/GLX/RANDR/RENDER/MIT-SHM/XFIXES/XTEST + iglx |
+| Zombie 回收 | `syscall.Wait4(-1, nil, 0, nil)` goroutine 持续回收子进程 |
+
+### 8.4 MVP 当前数据流全景
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       浏览器                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  <video> ← MediaStream (video + audio tracks merged) │   │
+│  │  mouse/key events → WebSocket signaling             │   │
+│  └──────────────────────────┬──────────────────────────┘   │
+└─────────────────────────────┼───────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │ WebSocket     │               │ WebRTC (UDP)
+              │ 信令+输入     │               │ 媒体流
+              ▼               │               ▼
+┌─────────────────────────────┼───────────────────────────────┐
+│  Agent 容器                  │                               │
+│  ┌──────────────────────────┴──────────────────────────┐   │
+│  │  SignalingServer (:8080/ws)                         │   │
+│  │  - offer/answer SDP 交换                            │   │
+│  │  - ICE candidate 转发                               │   │
+│  │  - input.* 输入事件 → handleInputMessage()          │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  WebRTCEngine (Pion, Lite ICE)                      │   │
+│  │  - VideoTrack (H.264 constrained-baseline)          │   │
+│  │  - AudioTrack (Opus 48kHz stereo)                   │   │
+│  │  - DataChannel control/bulk (仅 Agent→浏览器)       │   │
+│  └──────────────────────────┬──────────────────────────┘   │
+│                             │ WriteSample                   │
+│  ┌──────────────────────────┴──────────────────────────┐   │
+│  │  GStreamer Pipeline (独立进程)                       │   │
+│  │  ximagesrc → videoconvert → x264enc → fdsink → pipe │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  xdotool (输入执行)                                  │   │
+│  │  mousemove / mousedown / mouseup / click / key       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  supervisord → Xvfb + PipeWire + XFCE 桌面          │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 8.5 MVP 待解决事项
+
+| 优先级 | 事项 | 说明 |
+|--------|------|------|
+| P1 | Opus 音频流端到端验证 | Pipeline 已配置，需验证 PulseAudio/PipeWire → Opus → Client 完整通路 |
+| P2 | DataChannel 双向修复 | 升级 Pion 或调整 ICE 配置，恢复 DataChannel 双向通信 |
+| P2 | 生产镜像构建 | 优化 Dockerfile 多阶段构建，减小镜像体积 |
+| P2 | 断线重连 | WebSocket/WebRTC 断线后的自动重连机制 |
+| P2 | 清理 debug 日志 | 移除 H264 Frame 计数、Raw msg.Data 等调试日志 |
+| P3 | 输入方式优化 | CGo 直接调用 XTest 扩展，替代 xdotool 进程创建开销 |
+| P3 | GStreamer 动态编码器选择 | 实现 `nvh264enc > vaapih264enc > x264enc` 的自动降级逻辑 |
+| P3 | GPU 透传测试 | NVIDIA GPU 环境测试 VirtualGL + nvh264enc |

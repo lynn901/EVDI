@@ -1,5 +1,8 @@
 # 云桌面客户端（Client）架构设计
 
+> **文档版本**: v1.1
+> **最后更新**: 2026-06-16（MVP 验证后更新）
+
 ---
 
 ## 1. 文档概述
@@ -672,6 +675,20 @@ Client                          Broker                      Agent
 
 ### 6.4 视频渲染方案
 
+> **⚠️ MVP 验证结果**：MVP 阶段使用 `<video>` 元素直接渲染 MediaStream（通过 `srcObject` 绑定），而非下述 Canvas 双层架构。Canvas 方案在水印功能实现时启用。MVP 中发现的关键问题：
+>
+> 1. **ontrack MSID 合并**：Pion 为 video 和 audio 轨道分别创建不同的 MSID，`ontrack` 触发两次，每次的 `event.streams[0]` 是不同的 MediaStream。直接赋值 `video.srcObject = event.streams[0]` 会导致音频流覆盖视频流（黑屏）。必须将所有 track 合并到同一个 MediaStream：
+>    ```typescript
+>    const combinedStream = new MediaStream()
+>    pc.ontrack = (event) => {
+>        combinedStream.addTrack(event.track)
+>        setMediaStream(new MediaStream(combinedStream.getTracks()))
+>    }
+>    ```
+> 2. **play() 调用**：设置 `srcObject` 后必须显式调用 `video.play()`，并捕获 `AbortError`（浏览器在 track 变化时可能中断 play）
+> 3. **双光标问题**：本地鼠标光标与远程光标重叠时，在视频容器上设置 CSS `cursor: none` 隐藏本地光标
+> 4. **坐标映射零值**：`video.videoWidth` 在 `loadedmetadata` 之前为 0，坐标映射前必须做零值检查
+
 **渲染架构**
 
 WebRTC 视频轨道（H.264）采用双层渲染架构：
@@ -749,6 +766,24 @@ Policy 为 `false` 时，Client 不初始化对应音频轨道，UI 入口置灰
 ---
 
 ## 7. DataChannel 控制协议
+
+> **⚠️ MVP 验证结果**：Pion WebRTC v4 Lite ICE 模式下，SCTP DataChannel 存在单向性问题——Agent→浏览器方向正常（浏览器可收到 `ctrl.ping`），但浏览器→Agent 方向失败。MVP 阶段输入事件改用 **WebSocket 信令通道** 传输，消息格式与 DataChannel 保持一致（外层加 `type` 字段用于 WebSocket 路由），便于未来切换回 DataChannel。输入事件通过 Zustand store 中的 `sendInput` 函数统一发送，与传输通道解耦。
+>
+> MVP 中 WebSocket 输入消息格式：
+> ```json
+> {
+>   "type": "input.mouse_move",
+>   "data": {
+>     "v": 1,
+>     "type": "input.mouse_move",
+>     "ts": 1700000000123,
+>     "seq": 13,
+>     "payload": { "x": 514, "y": 298, "display_id": 0 }
+>   }
+> }
+> ```
+>
+> 外层 `type` 用于 WebSocket 消息路由，内层 `data` 是 DataChannel 消息结构，与 §7.2 定义完全一致。正式版本修复 DataChannel 双向通信后，`sendInput` 只需切换底层传输通道，上层逻辑无需修改。
 
 ### 7.1 协议设计原则
 
@@ -1279,41 +1314,48 @@ ctx.drawImage(offscreen, x, y);
 
 ## 10. 性能目标
 
-> 本章指标当前为 TBD，待性能测试阶段根据实测数据填入。以下为设计参考方向，不作为当前验收标准。
+> MVP 阶段已在 WSL2 + Podman（`--network host`）环境下完成基线测试，以下标注 MVP 基线值。正式性能测试将在完整部署环境下进行。
 
 ### 10.1 端到端延迟
 
-端到端延迟定义为：用户产生键鼠输入 → DataChannel 传输 → 桌面处理 → 视频编码 → WebRTC 传输 → Client 解码渲染的完整链路延迟。
+端到端延迟定义为：用户产生键鼠输入 → 传输通道 → 桌面处理 → 视频编码 → WebRTC 传输 → Client 解码渲染的完整链路延迟。
 
-| 网络环境 | 目标延迟 | 说明 |
-|---------|---------|------|
-| 局域网（< 1ms RTT） | TBD | 理想环境基线 |
-| 城域网（< 10ms RTT） | TBD | 主要使用场景 |
-| 广域网（< 50ms RTT） | TBD | 远程接入场景 |
+| 网络环境 | 目标延迟 | MVP 基线 | 说明 |
+|---------|---------|---------|------|
+| 局域网（< 1ms RTT） | < 80ms | ~50-80ms | WSL2 本地测试，x264enc 软编码 + xdotool 输入 |
+| 城域网（< 10ms RTT） | < 150ms | 待测 | 主要使用场景 |
+| 广域网（< 50ms RTT） | < 300ms | 待测 | 远程接入场景 |
+
+> **MVP 延迟构成参考**：x264enc 编码 ~10-20ms + WebRTC 传输 ~5-10ms（局域网）+ xdotool 输入注入 ~5-15ms。主要瓶颈在 xdotool 进程创建开销，迁移至 XTest CGo 后输入延迟预计可降至 < 5ms。
 
 ### 10.2 帧率目标
 
-| 场景 | 目标帧率 | 说明 |
-|------|---------|------|
-| 办公场景（文档、浏览器） | TBD | 低动态画面 |
-| 开发场景（IDE、终端） | TBD | 中动态画面 |
-| 图形场景（视频、设计工具） | TBD | 高动态画面 |
+| 场景 | 目标帧率 | MVP 基线 | 说明 |
+|------|---------|---------|------|
+| 办公场景（文档、浏览器） | ≥ 25 FPS | 25-30 FPS | x264enc ultrafast，静态画面码率约 500Kbps-2Mbps |
+| 开发场景（IDE、终端） | ≥ 25 FPS | 25-30 FPS | 中动态画面 |
+| 图形场景（视频、设计工具） | ≥ 20 FPS | 15-25 FPS | 高动态画面，软件编码瓶颈 |
+
+> **MVP 测试条件**：1920x1080，x264enc `tune=zerolatency speed-preset=ultrafast threads=1`，WSL2 容器内无 GPU 加速。硬件编码（nvh264enc / vaapih264enc）预计可显著提升帧率。
 
 ### 10.3 带宽消耗基线
 
-| 场景 | 目标带宽 | 编码参数 |
-|------|---------|---------|
-| 1080p 办公 | TBD | H.264，码率 TBD |
-| 1080p 图形 | TBD | H.264，码率 TBD |
-| 4K 办公 | TBD | H.264，码率 TBD |
+| 场景 | 目标带宽 | MVP 基线 | 编码参数 |
+|------|---------|---------|---------|
+| 1080p 办公 | 1-3 Mbps | 0.5-2 Mbps | H.264 constrained-baseline，x264enc ultrafast |
+| 1080p 图形 | 3-8 Mbps | 2-5 Mbps | H.264 constrained-baseline，x264enc ultrafast |
+| 4K 办公 | 4-10 Mbps | 待测 | 需硬件编码支持 |
+
+> **MVP 测试条件**：x264enc 未显式设置 bitrate 参数，由编码器自适应。正式版本需配置目标码率并根据网络状况动态调整。
 
 ### 10.4 性能测试计划
 
 性能指标将在以下阶段采集：
 
-- **阶段一**：Web 客户端单机压测，采集局域网基线数据
-- **阶段二**：Native 客户端对比测试，与 Web 端渲染性能对比
-- **阶段三**：多并发用户压测，采集带宽与服务端负载数据
+- **阶段一（MVP 已完成）**：Web 客户端单机测试，WSL2 + Podman 环境，采集局域网基线数据 ✅
+- **阶段二**：GPU 硬件编码测试，NVIDIA NVENC / Intel VAAPI 环境对比
+- **阶段三**：Native 客户端对比测试，与 Web 端渲染性能对比
+- **阶段四**：多并发用户压测，采集带宽与服务端负载数据
 
 测试完成后本章指标更新为实测值，并标注测试环境与测试工具。
 
@@ -1457,3 +1499,79 @@ Content-Security-Policy:
 > **注意**：`connect-src` 中的 `*.example.com` 为占位符，上线前需替换为实际 Broker 与 Agent（通过桌面实例域名或 Broker 代理）的连接域名。
 
 ---
+
+## 12. MVP 验证记录
+
+> 本章记录 Web 客户端 MVP 阶段的验证结果、与正式架构的偏差、以及调试过程中发现的关键经验。完整调试过程详见 `docs/mvp/2026-06-11-mvp-debug-record.md`。
+
+### 12.1 MVP 验证范围与结果
+
+| 验证项 | 状态 | 说明 |
+|--------|------|------|
+| WebSocket 信令连接 | ✅ 通过 | `ws://${hostname}:8080/ws`，自动适配地址 |
+| SDP Offer/Answer 交换 | ✅ 通过 | Client 发 Offer，Agent 回 Answer |
+| ICE 候选交换 | ✅ 通过 | Trickle ICE，候选逐条通过 WebSocket 转发 |
+| H.264 视频流接收与渲染 | ✅ 通过 | `<video>` 直接渲染，30 FPS |
+| Opus 音频流 | ⏳ 待验证 | 未完整端到端测试 |
+| 鼠标移动 | ✅ 通过 | 通过 WebSocket 信令通道，坐标映射正确 |
+| 鼠标按键（左/右/中） | ✅ 通过 | mousedown/mouseup 事件 |
+| 滚轮 | ✅ 通过 | wheel 事件，需 `passive: false` |
+| 键盘输入（字母/数字/功能键） | ✅ 通过 | `e.keyCode` 映射至 X11 KeySym |
+| 修饰键（Ctrl/Shift/Alt） | ✅ 通过 | `xdotool key --clearmodifiers` |
+| Caps Lock 状态同步 | ✅ 通过 | `e.getModifierState('CapsLock')` + Agent 同步 |
+| 剪贴板同步 | ⏳ MVP no-op | 消息格式已定义，功能未实现 |
+| 分辨率调整 | ⏳ MVP no-op | 消息格式已定义，功能未实现 |
+| 水印 | ⏳ 未实现 | Canvas 双层渲染方案待实现 |
+| DataChannel 双向 | ❌ 失败 | 浏览器→Agent 方向不通，改用 WebSocket |
+
+### 12.2 MVP 与正式架构的偏差汇总
+
+| 偏差项 | 正式架构设计 | MVP 实际实现 | 修正方向 |
+|--------|------------|------------|---------|
+| 视频渲染 | Canvas 双层渲染（`<video>` 解码 + Canvas 合成） | `<video>` 直接渲染 | 水印功能实现时切换至 Canvas 方案 |
+| 输入事件传输 | DataChannel (control 通道) | WebSocket 信令通道 | 修复 DataChannel 后回归 |
+| 信令服务 | Broker Gateway Service | Agent 内建 WebSocket | 正式版接入 Broker Gateway |
+| 认证 | JWT + Session Token | 无认证 | 正式版接入 Broker 认证 |
+| 断线重连 | 指数退避 + Session 超时 | 无重连机制 | 正式版实现 §8 定义的完整重连逻辑 |
+
+### 12.3 MVP 前端关键经验
+
+#### 12.3.1 WebRTC 连接与渲染
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| 黑屏（ICE connected 但无画面） | Pion 为 video/audio 创建不同 MSID，`ontrack` 触发两次，音频流覆盖视频流 | 合并所有 track 到同一个 MediaStream |
+| video 不播放 | 设置 srcObject 后未调用 `play()` | 显式调用 `video.play()` 并捕获 `AbortError` |
+| 坐标映射 (0,0) | `video.videoWidth` 在 `loadedmetadata` 之前为 0 | 坐标映射前检查 `videoWidth/videoHeight` 是否为 0 |
+| 双光标重叠 | 本地光标与远程光标同时显示 | CSS `cursor: none` 隐藏本地光标 |
+| VP8 被协商而非 H.264 | 默认 MediaEngine 注册所有编解码器 | Agent 端自定义 MediaEngine 只注册 H.264 + Opus |
+
+#### 12.3.2 输入事件处理
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| React Hook 实例隔离 | `useWebRTC()` 在不同组件中创建独立实例，signaling ref 不共享 | 通过 Zustand store 共享 `sendInput` 函数 |
+| passive listener | React 的 `onWheel` 是 passive listener，无法 `preventDefault()` | 用 `addEventListener('wheel', handler, { passive: false })` |
+| 浏览器右键菜单 | 右键点击视频区域弹出浏览器菜单 | `addEventListener('contextmenu', e => e.preventDefault())` |
+| 文字选中干扰 | 拖拽时选中页面文字 | CSS `userSelect: 'none'` |
+| Caps Lock 大小写反转 | 字母键用大写 keysym，xdotool 自动加 Shift 与 Caps Lock 冲突 | 字母键用小写 keysym，Agent 端同步 Caps Lock 状态 |
+| 键盘事件被浏览器拦截 | 部分快捷键（如 F5、Ctrl+T）被浏览器消费 | `e.preventDefault()` + `e.stopPropagation()`，Tab 键等可能无法完全拦截 |
+
+#### 12.3.3 容器与部署
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| Agent 地址硬编码 | 客户端写死 IP 地址 | 使用 `` ws://${window.location.hostname}:8080/ws `` 自动适配 |
+| `--network host` X display 冲突 | 宿主机已运行同编号 Xvfb | 确保无残留进程，或使用不同 DISPLAY 编号 |
+
+### 12.4 MVP 待解决事项
+
+| 优先级 | 事项 | 说明 |
+|--------|------|------|
+| P1 | Canvas 双层渲染实现 | 启用水印功能，实现 `<video>` + Canvas 合成方案 |
+| P1 | 音频端到端验证 | 验证 Opus 音频流在浏览器端的完整播放 |
+| P2 | DataChannel 双向修复 | 修复 Pion Lite ICE DataChannel，输入事件回归 DataChannel |
+| P2 | 断线重连实现 | WebSocket/WebRTC 断线后的指数退避重连 |
+| P2 | Token 认证接入 | 接入 Broker JWT 认证流程 |
+| P3 | 键盘事件优化 | 使用 `e.code`（W3C KeyboardEvent.code）替代已废弃的 `e.keyCode`，与 DataChannel 协议定义对齐 |
+| P3 | 浏览器快捷键拦截 | Web 端无法拦截的系统快捷键（F5、Ctrl+T 等），Native 客户端通过键盘 Hook 解决 |
