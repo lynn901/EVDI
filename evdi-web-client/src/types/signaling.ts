@@ -42,6 +42,8 @@ export interface MouseWheelPayload {
   delta_y: number
   x: number
   y: number
+  /** Browser WheelEvent.deltaMode: 0=pixels, 1=lines, 2=pages */
+  delta_mode: number
 }
 
 export interface KeyPayload {

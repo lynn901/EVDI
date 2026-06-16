@@ -27,11 +27,14 @@ type MouseButtonPayload struct {
 }
 
 // MouseWheelPayload represents a mouse scroll event.
+// DeltaX/DeltaY use float64 because browser WheelEvent.deltaX/deltaY are double
+// and frequently non-integer (e.g., trackpad: 3.5, macOS: 4.2).
+// Using int caused silent JSON unmarshal failures for fractional values.
 type MouseWheelPayload struct {
-	DeltaX int `json:"delta_x"`
-	DeltaY int `json:"delta_y"`
-	X      int `json:"x"`
-	Y      int `json:"y"`
+	DeltaX float64 `json:"delta_x"`
+	DeltaY float64 `json:"delta_y"`
+	X      int     `json:"x"`
+	Y      int     `json:"y"`
 }
 
 // KeyPayload represents a keyboard key event.

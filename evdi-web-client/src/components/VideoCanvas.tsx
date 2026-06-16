@@ -40,7 +40,30 @@ export const VideoCanvas: React.FC<Props> = ({ stream }) => {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
       const { x, y } = getPos(e)
-      sendInput('input.mouse_wheel', { delta_x: e.deltaX, delta_y: e.deltaY, x, y } satisfies MouseWheelPayload)
+
+      // Normalize deltas to "lines" unit so the agent can interpret them consistently.
+      // Browser WheelEvent.deltaMode:
+      //   0 = DOM_DELTA_PIXEL → typical values: ±100 per notch (Chrome/Windows) or ±4 (macOS)
+      //   1 = DOM_DELTA_LINE  → typical values: ±3 per notch (Firefox/Linux)
+      //   2 = DOM_DELTA_PAGE  → typically ±1 per notch
+      //
+      // We normalize everything to "lines" because xdotool click 4/5 ≈ one line of scroll.
+      let normX = e.deltaX
+      let normY = e.deltaY
+      switch (e.deltaMode) {
+        case 0: // DOM_DELTA_PIXEL → convert pixels to lines (≈1 line per 40px, matching typical OS settings)
+          normX = e.deltaX / 40
+          normY = e.deltaY / 40
+          break
+        case 1: // DOM_DELTA_LINE → already in lines
+          break
+        case 2: // DOM_DELTA_PAGE → one page ≈ 30 lines
+          normX = e.deltaX * 30
+          normY = e.deltaY * 30
+          break
+      }
+
+      sendInput('input.mouse_wheel', { delta_x: normX, delta_y: normY, x, y, delta_mode: 1 } satisfies MouseWheelPayload)
     }
 
     const onMouseDown = (e: MouseEvent) => {

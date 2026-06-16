@@ -129,8 +129,12 @@ func handleInputMessage(msg webrtc.DataChannelMessage, mouseCh chan<- webrtc.Mou
 		}
 	case "input.mouse_wheel":
 		var p webrtc.MouseWheelPayload
-		if err := json.Unmarshal(msg.Payload, &p); err == nil {
-			input.MouseWheelCmd(p.DeltaX, p.DeltaY).Start()
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			log.Printf("[Input] mouse_wheel unmarshal error: %v", err)
+		} else {
+			for _, cmd := range input.MouseWheelCmd(p.DeltaX, p.DeltaY) {
+				cmd.Start()
+			}
 		}
 	case "input.key":
 		var p webrtc.KeyPayload

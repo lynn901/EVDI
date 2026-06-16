@@ -51,3 +51,49 @@ func TestKeyPayload(t *testing.T) {
 		t.Errorf("payload = %+v, want keycode=65 action=down", p)
 	}
 }
+
+func TestMouseWheelPayloadIntegerDelta(t *testing.T) {
+	raw := `{"v":1,"type":"input.mouse_wheel","ts":0,"seq":0,"payload":{"delta_x":0,"delta_y":3,"x":500,"y":300}}`
+	var msg DataChannelMessage
+	json.Unmarshal([]byte(raw), &msg)
+	var p MouseWheelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		t.Fatalf("unmarshal integer delta: %v", err)
+	}
+	if p.DeltaY != 3.0 {
+		t.Errorf("delta_y = %v, want 3.0", p.DeltaY)
+	}
+}
+
+func TestMouseWheelPayloadFractionalDelta(t *testing.T) {
+	// This was the root cause of the scroll bug: fractional deltaY values
+	// (common on trackpads and macOS) failed silently with int fields.
+	raw := `{"v":1,"type":"input.mouse_wheel","ts":0,"seq":0,"payload":{"delta_x":0.5,"delta_y":3.7,"x":500,"y":300}}`
+	var msg DataChannelMessage
+	json.Unmarshal([]byte(raw), &msg)
+	var p MouseWheelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		t.Fatalf("unmarshal fractional delta: %v", err)
+	}
+	if p.DeltaX != 0.5 {
+		t.Errorf("delta_x = %v, want 0.5", p.DeltaX)
+	}
+	if p.DeltaY != 3.7 {
+		t.Errorf("delta_y = %v, want 3.7", p.DeltaY)
+	}
+}
+
+func TestMouseWheelPayloadLargePixelDelta(t *testing.T) {
+	// Chrome/Windows sends deltaY=100 in pixel mode (deltaMode=0).
+	// After normalization to lines in the client, this becomes ~2.5 lines.
+	raw := `{"v":1,"type":"input.mouse_wheel","ts":0,"seq":0,"payload":{"delta_x":0,"delta_y":2.5,"x":500,"y":300,"delta_mode":1}}`
+	var msg DataChannelMessage
+	json.Unmarshal([]byte(raw), &msg)
+	var p MouseWheelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		t.Fatalf("unmarshal large pixel delta: %v", err)
+	}
+	if p.DeltaY != 2.5 {
+		t.Errorf("delta_y = %v, want 2.5", p.DeltaY)
+	}
+}
