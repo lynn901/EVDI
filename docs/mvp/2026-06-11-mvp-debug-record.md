@@ -702,6 +702,63 @@ export interface MouseWheelPayload {
 
 **核心教训**：凡是从浏览器接收数值字段的 Go 结构体，除非确定值总是整数，否则一律使用 `float64`。反序列化错误绝不能静默吞掉，必须记录日志。
 
+### §5.18 音频流：桌面内播放视频客户端无声音
+
+**现象**：云桌面 Firefox 播放 YouTube 视频，客户端浏览器能看画面但听不到声音。
+
+**排查过程**：
+
+1. **服务端 GStreamer Pipeline 缺少音频**：原始 `launcher.go` 只有 `ximagesrc → x264enc → fdsink` 视频链路，无音频源。
+2. **audioTrack 从未被写入**：`pipeline.go` 的 `Start()` 只启动视频读取，`audioTrack` 虽然在 `WebRTCEngine` 中创建并 `AddTrack`，但从未调用 `WriteSample`。
+3. **缺少 Go Opus 编码器**：`go.mod` 无 `github.com/hraban/opus` 依赖。
+
+**修复方案**：沿用视频 pipeline 的架构模式（GStreamer 子进程 → stdout pipe → Go 读取 → WriteSample），新增独立的音频采集链路：
+
+```
+GStreamer audio subprocess (独立进程):
+  pulsesrc device=auto_null.monitor → audioconvert → audioresample
+  → audio/x-raw,format=S16LE,rate=48000,channels=2 → fdsink fd=1
+
+Go audio reader goroutine:
+  每 20ms 读取 3840 字节 PCM (960 samples × 2ch × 2 bytes)
+  → Opus 编码 (github.com/hraban/opus, 48kHz stereo, AppVoIP)
+  → audioTrack.WriteSample()
+```
+
+**为什么用 PCM + Go 编码而非 GStreamer opusenc？**
+- GStreamer `fdsink` 输出 Opus 帧**无边界标记**，无法区分帧起止
+- PCM 是固定帧大小（3840 字节/20ms），天然解决帧边界问题
+- 与 Pion 的 `WriteSample` 期望格式直接匹配
+
+**修复细节**：
+
+| 文件 | 修改 |
+|------|------|
+| `Dockerfile` | Builder 阶段添加 `libopus-dev libopusfile-dev`，Runtime 阶段添加 `libopusfile0` |
+| `config.go` | 新增 `PulseServer string` 字段，从 `PULSE_SERVER` 环境变量读取 |
+| `launcher.go` | 新增 `AudioGStreamerCmd` 结构体，启动 `pulsesrc device=auto_null.monitor` 管道，设 `PULSE_SERVER` 环境变量，使用 `--quiet` 防止 GStreamer 状态消息混入 stdout |
+| `pipeline.go` | 新增 `audioCmd`、`opusEnc` 字段；`Start()` 中调用 `startAudio()`（非致命）；新增 `readAudioStream()` 读取 PCM → Opus 编码 → WriteSample；新增 `bytesToSamples()` S16LE 转换 |
+| `VideoCanvas.tsx` | 显式设置 `video.muted = false`（修复 Chrome autoplay 静音问题）；`handleClick` 中强制 unmute |
+
+**踩坑记录**：
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| `opusfile.pc not found` | `github.com/hraban/opus` CGo 编译需要 `libopusfile-dev` | Dockerfile builder 阶段添加 `libopusfile-dev` |
+| `libopusfile.so.0: cannot open shared object file` | 运行时缺少动态库，builder 有 dev 包但 runtime 缺 | Dockerfile runtime 阶段添加 `libopusfile0` |
+| Agent 崩溃循环 | 缺少 `libopusfile.so.0` 导致 agent 启动失败，supervisord 重试耗尽进入 FATAL | 修复 Dockerfile 后重建镜像 |
+| Chrome 自动静音 | Chrome autoplay policy 将 `<video>` 元素的 `video.muted` 设为 `true`，即使 HTML 无 `muted` 属性 | 显式设置 `video.muted = false` |
+| Firefox 音频 `[paused]` | Firefox 在 PipeWire 中的音频流状态为 paused，需等视频实际播放后才会变为 active | 用户正常操作即可，不是 bug |
+
+**验证结果**：Agent 日志显示 Opus 帧 3 字节（静音）→ 248+ 字节（有音频）；客户端浏览器 `video.muted: false`, `audioTracks: 1`, audio track `muted: false, readyState: live` → ✅ 音频正常播放。
+
+**变更统计**：5 个文件，+195/-3 行。
+
+**核心教训**：
+1. Chrome autoplay policy 可能在无 `muted` HTML 属性的情况下静默将 `video.muted` 设为 `true`，WebRTC 音频必须显式 `video.muted = false`
+2. GStreamer `fdsink` 输出 Opus 帧无边界，PCM 是更好的跨进程音频传输格式
+3. `github.com/hraban/opus` 的 CGo 编译需要 `libopusfile-dev`，运行时需要 `libopusfile0`——两个阶段缺一不可
+
 ---
 
 ## 六、关键经验总结
@@ -731,6 +788,7 @@ export interface MouseWheelPayload {
 |------|------|
 | ontrack 合并流 | Pion 为 video/audio 创建不同 MSID，必须合并到同一个 MediaStream |
 | play() 调用 | 设置 srcObject 后必须显式调用 play()，并捕获 AbortError |
+| **video.muted = false** | **Chrome autoplay policy 可能在无 HTML `muted` 属性时静默将 `video.muted` 设为 `true`，WebRTC 音频必须显式设置 `video.muted = false`** |
 | 视频坐标映射 | 必须等 `loadedmetadata` 后才能使用 `videoWidth/videoHeight` 进行坐标映射 |
 | React Hook 实例隔离 | `useWebRTC()` 在不同组件中创建独立实例，signaling ref 不共享。必须通过 Zustand store 传递 sendInput 函数 |
 | passive 事件 | React 的 `onWheel` 是 passive listener，必须用 `addEventListener('wheel', handler, { passive: false })` 手动绑定 |
@@ -776,7 +834,7 @@ export interface MouseWheelPayload {
 ┌─────────────────────────────────────────────────────────────┐
 │                       浏览器                                  │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │  <video> ← MediaStream (video + audio tracks)       │   │
+│  │  <video muted=false> ← MediaStream (video+audio)    │   │
 │  │  mouse/key events → WebSocket signaling             │   │
 │  └──────────────────────────┬──────────────────────────┘   │
 └─────────────────────────────┼───────────────────────────────┘
@@ -801,15 +859,25 @@ export interface MouseWheelPayload {
 │  └──────────────────────────┬──────────────────────────┘   │
 │                             │ WriteSample                   │
 │  ┌──────────────────────────┴──────────────────────────┐   │
-│  │  GStreamer Pipeline (独立进程)                       │   │
+│  │  GStreamer Video Pipeline (独立进程)                 │   │
 │  │  ximagesrc → videoconvert → x264enc → fdsink → pipe │   │
+│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  GStreamer Audio Pipeline (独立进程)                 │   │
+│  │  pulsesrc(auto_null.monitor) → audioconvert →       │   │
+│  │  audioresample → S16LE/48kHz/2ch → fdsink → pipe   │   │
+│  └──────────────────────────┬──────────────────────────┘   │
+│                             │ PCM stdout pipe               │
+│  ┌──────────────────────────┴──────────────────────────┐   │
+│  │  Go Opus Encoder (github.com/hraban/opus)            │   │
+│  │  S16LE []byte → []int16 → Opus 20ms frames          │   │
 │  └─────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  xdotool (输入执行)                                  │   │
 │  │  mousemove / mousedown / mouseup / click / key       │   │
 │  └─────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │  Xvfb :100 + PulseAudio + XFCE                      │   │
+│  │  Xvfb :20 + PipeWire + WirePlumber + XFCE           │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -820,7 +888,7 @@ export interface MouseWheelPayload {
 
 | 优先级 | 事项 | 说明 |
 |--------|------|------|
-| P1 | 音频流测试 | 当前 Pipeline 只实现了视频，PulseAudio → Opus 通路待验证 |
+| ~~P1~~ | ~~音频流测试~~ | **已解决**：PipeWire monitor → GStreamer PCM → Go Opus 编码 → WebRTC AudioTrack（详见 §5.18） |
 | ~~P1~~ | ~~容器入口脚本优化~~ | **已解决**：Agent 不再启动 Xvfb，entrypoint.sh 统一管理 + supervise 自动恢复 |
 | ~~P1~~ | ~~客户端连接问题~~ | **已解决**：`--network host` + 清理宿主机残留 Xvfb + 客户端地址自适应 |
 | ~~P1~~ | ~~Caps Lock 大小写反转~~ | **已解决**：字母键用小写 keysym + Caps Lock 状态同步 |
