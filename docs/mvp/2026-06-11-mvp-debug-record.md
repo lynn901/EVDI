@@ -1,6 +1,6 @@
 # MVP 调试记录：WebRTC 视频流 + 鼠标键盘输入
 
-> **文档版本**: v1.0
+> **文档版本**: v1.1
 > **创建日期**: 2026-06-11
 > **状态**: 已解决
 
@@ -528,6 +528,180 @@ xdotool key a（Caps Lock ON） → keysym 'a' → 输出 'A' ✓（X11 自动�
 
 同时修复了 Caps Lock 状态同步：客户端发送 `capsLock: e.getModifierState('CapsLock')`，Agent 在每次字母键按下前用 `syncCapsLockSync()`（同步执行 `.Run()`）确保 X11 的 Caps Lock 状态与客户端一致。
 
+### 5.17 鼠标滚轮事件完全无效
+
+**现象**：云桌面内鼠标滚轮滑动没有任何效果，页面不滚动、列表不滚动。
+
+**排查过程**（系统化调试）：
+
+按数据流逐层追踪：`浏览器 WheelEvent → WebSocket → Agent JSON 解析 → xdotool 执行`
+
+1. **浏览器捕获层**：`VideoCanvas.tsx` 的 `onWheel` 事件处理器正常触发，`e.deltaX`/`e.deltaY` 值存在
+2. **WebSocket 传输层**：`sendInput` 通过 WebSocket 发送 `input.mouse_wheel` 消息，Agent `signaling.go` 的 `default` 分支正常接收
+3. **JSON 反序列化层**：🔴 **关键断点**——`json.Unmarshal(msg.Payload, &p)` 失败，但错误被静默吞掉
+4. **xdotool 执行层**：未到达
+
+**根因分析**（4 个 Bug，Bug #1 是主因）：
+
+#### Bug #1（致命）：Go `int` 类型与浏览器 `double` 类型不匹配导致 JSON 反序列化静默失败
+
+Go 的 `MouseWheelPayload` 结构体将 `DeltaX`/`DeltaY` 声明为 `int`：
+
+```go
+// 旧代码
+type MouseWheelPayload struct {
+    DeltaX int `json:"delta_x"`  // ← int 类型
+    DeltaY int `json:"delta_y"`  // ← int 类型
+    X      int `json:"x"`
+    Y      int `json:"y"`
+}
+```
+
+但浏览器的 `WheelEvent.deltaX`/`deltaY` 是 `double`（float64）类型，且**经常产生非整数值**：
+
+| 设备/平台 | deltaY 典型值 | 是否整数 | JSON 反序列化结果 |
+|-----------|-------------|---------|-----------------|
+| 笔记本触控板 | 3.5, 1.2, 0.3 | ❌ | **失败 → 事件丢弃** |
+| macOS 任何鼠标 | 4.2, -1.5 | ❌ | **失败 → 事件丢弃** |
+| Windows 平滑滚动 | 可能非整数 | ❌ | **可能失败** |
+| Windows 标准鼠标 | ±100, ±120 | ✅ | 成功（但有其他 Bug） |
+| Linux 标准鼠标 | ±3 | ✅ | 成功（但有其他 Bug） |
+
+当 JSON 中出现 `"delta_y": 3.5` 时，Go 的 `json.Unmarshal` 无法将浮点数反序列化到 `int` 字段，返回错误。而 `main.go` 中的错误处理将错误**静默吞掉**：
+
+```go
+// 旧代码：错误被静默忽略
+if err := json.Unmarshal(msg.Payload, &p); err == nil {
+    input.MouseWheelCmd(p.DeltaX, p.DeltaY).Start()
+}
+// err != nil 时 → 滚轮事件被完全丢弃，无日志！
+```
+
+**云桌面场景下，笔记本用户和 macOS 用户是主流群体 → 滚轮 100% 不工作。**
+
+#### Bug #2（严重）：滚动幅度完全丢失
+
+旧 `MouseWheelCmd` 忽略 delta 绝对值，每次只产生 1 次 `xdotool click`：
+
+```go
+// 旧代码
+func MouseWheelCmd(deltaX, deltaY int) *exec.Cmd {
+    if deltaY > 0 {
+        return exec.Command("xdotool", "click", "4")
+    } else if deltaY < 0 {
+        return exec.Command("xdotool", "click", "5")
+    }
+    return exec.Command("xdotool", "click", "0")  // button 0 无效
+}
+```
+
+`deltaY = 100`（慢滚）和 `deltaY = 300`（快滚）都只产生一次 click，滚动速度和距离无法反映到桌面。
+
+#### Bug #3（严重）：缺少 deltaMode 归一化
+
+浏览器的 `WheelEvent.deltaMode` 决定 delta 值的单位：
+- `0` = DOM_DELTA_PIXEL → deltaY ≈ 100（像素）
+- `1` = DOM_DELTA_LINE → deltaY ≈ 3（行）
+- `2` = DOM_DELTA_PAGE → deltaY ≈ 1（页）
+
+旧实现不发送也不使用 `deltaMode`，无法区分不同模式，跨平台滚动行为不一致。
+
+#### Bug #4（中等）：无效的 `xdotool click 0`
+
+当 deltaX 和 deltaY 都为 0 时，执行 `xdotool click 0`，但 X11 没有 button 0，xdotool 报错。
+
+**修复方案**：
+
+**1. `datachannel.go`：DeltaX/DeltaY 改为 float64**
+
+```go
+type MouseWheelPayload struct {
+    DeltaX float64 `json:"delta_x"`  // 浏览器 WheelEvent 是 double
+    DeltaY float64 `json:"delta_y"`  // 触控板/macOS 经常产生非整数值
+    X      int     `json:"x"`
+    Y      int     `json:"y"`
+}
+```
+
+**2. `mouse.go`：重写 MouseWheelCmd**
+
+```go
+func MouseWheelCmd(deltaX, deltaY float64) []*exec.Cmd {
+    var cmds []*exec.Cmd
+    // 垂直滚动：button 4=上, 5=下，按幅度计算 repeat 次数
+    if deltaY != 0 {
+        button := 5
+        if deltaY < 0 { button = 4 }
+        clicks := int(math.Abs(deltaY))
+        if clicks < 1  { clicks = 1 }  // 非零 delta 至少 1 次
+        if clicks > 20 { clicks = 20 } // 上限防止失控
+        cmds = append(cmds, exec.Command("xdotool", "click",
+            "--repeat", fmt.Sprintf("%d", clicks), "--delay", "0",
+            fmt.Sprintf("%d", button)))
+    }
+    // 水平滚动：button 6=左, 7=右
+    if deltaX != 0 {
+        button := 7
+        if deltaX < 0 { button = 6 }
+        clicks := int(math.Abs(deltaX))
+        if clicks < 1  { clicks = 1 }
+        if clicks > 20 { clicks = 20 }
+        cmds = append(cmds, exec.Command("xdotool", "click",
+            "--repeat", fmt.Sprintf("%d", clicks), "--delay", "0",
+            fmt.Sprintf("%d", button)))
+    }
+    return cmds
+}
+```
+
+**3. `main.go`：适配新返回类型 + 添加错误日志**
+
+```go
+case "input.mouse_wheel":
+    var p webrtc.MouseWheelPayload
+    if err := json.Unmarshal(msg.Payload, &p); err != nil {
+        log.Printf("[Input] mouse_wheel unmarshal error: %v", err)  // 不再静默
+    } else {
+        for _, cmd := range input.MouseWheelCmd(p.DeltaX, p.DeltaY) {
+            cmd.Start()
+        }
+    }
+```
+
+**4. `VideoCanvas.tsx`：deltaMode 归一化**
+
+```typescript
+const onWheel = (e: WheelEvent) => {
+    e.preventDefault()
+    const { x, y } = getPos(e)
+    // 归一化为"行"单位，1 行 ≈ 1 次 xdotool click
+    let normX = e.deltaX, normY = e.deltaY
+    switch (e.deltaMode) {
+        case 0:  normX = e.deltaX / 40; normY = e.deltaY / 40; break  // 像素→行
+        case 2:  normX = e.deltaX * 30; normY = e.deltaY * 30; break  // 页→行
+    }
+    sendInput('input.mouse_wheel', { delta_x: normX, delta_y: normY, x, y, delta_mode: 1 })
+}
+```
+
+**5. `signaling.ts`：添加 delta_mode 字段**
+
+```typescript
+export interface MouseWheelPayload {
+    delta_x: number
+    delta_y: number
+    x: number
+    y: number
+    delta_mode: number  // 0=pixels, 1=lines, 2=pages（归一化后固定为 1）
+}
+```
+
+**验证结果**：重建 Agent 镜像 → 重启容器 → 浏览器连接测试 → ✅ 鼠标滚轮正常工作。
+
+**变更统计**：7 个文件，+206/-13 行。
+
+**核心教训**：凡是从浏览器接收数值字段的 Go 结构体，除非确定值总是整数，否则一律使用 `float64`。反序列化错误绝不能静默吞掉，必须记录日志。
+
 ---
 
 ## 六、关键经验总结
@@ -575,6 +749,11 @@ xdotool key a（Caps Lock ON） → keysym 'a' → 输出 'A' ✓（X11 自动�
 | Caps Lock 同步 | 客户端发送 `capsLock` 状态，Agent 同步 X11 的 Caps Lock 状态。同步必须用 `.Run()`（阻塞），不能用 `.Start()`（异步），否则竞态导致按键在 Caps Lock 切换前执行 |
 | 修饰键 | `xdotool keydown "ctrl+A"` 不等于"按住ctrl按A"，用 `xdotool key --clearmodifiers ctrl+A` |
 | Zombie 回收 | `exec.Command.Start()` 启动的进程必须有人 wait，否则变成 zombie。用 `syscall.Wait4(-1, ...)` goroutine 回收 |
+| **浏览器→Go 数值类型** | **浏览器 DOM 事件属性是 `double`（如 WheelEvent.deltaX/deltaY），Go 结构体必须用 `float64` 接收，用 `int` 会导致非整数值的 JSON 反序列化静默失败** |
+| **JSON 反序列化错误** | **绝不能静默吞掉 `json.Unmarshal` 的错误，必须 `log.Printf` 记录** |
+| **滚轮幅度映射** | 使用 `xdotool click --repeat N --delay 0 BUTTON` 按幅度滚动，而非每次只 click 1 次 |
+| **deltaMode 归一化** | 浏览器 `WheelEvent.deltaMode` 分像素/行/页三种模式，客户端必须归一化为统一单位（行）后再发送 |
+| **X11 滚轮按钮** | button 4=上, 5=下, 6=左, 7=右；button 0 不存在，delta 为 0 时不应执行任何命令 |
 
 ### 6.5 容器运行与部署要点
 
@@ -645,6 +824,7 @@ xdotool key a（Caps Lock ON） → keysym 'a' → 输出 'A' ✓（X11 自动�
 | ~~P1~~ | ~~容器入口脚本优化~~ | **已解决**：Agent 不再启动 Xvfb，entrypoint.sh 统一管理 + supervise 自动恢复 |
 | ~~P1~~ | ~~客户端连接问题~~ | **已解决**：`--network host` + 清理宿主机残留 Xvfb + 客户端地址自适应 |
 | ~~P1~~ | ~~Caps Lock 大小写反转~~ | **已解决**：字母键用小写 keysym + Caps Lock 状态同步 |
+| ~~P1~~ | ~~鼠标滚轮无效~~ | **已解决**：float64 类型 + 幅度映射 + deltaMode 归一化（详见 §5.17） |
 | P2 | DataChannel 双向修复 | 升级 Pion 或调整 ICE 配置，恢复 DataChannel 双向通信 |
 | P2 | 生产镜像构建 | 优化 Dockerfile 多阶段构建，减小镜像体积 |
 | P2 | 断线重连 | WebSocket/WebRTC 断线后的自动重连机制 |
