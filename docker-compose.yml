@@ -13,6 +13,8 @@ services:
       - VIDEO_FPS=30
       - WEBRTC_PORT_MIN=50000
       - WEBRTC_PORT_MAX=50100
+      - PASSWD=evdi
+      - TZ=Asia/Shanghai
     restart: unless-stopped
     cap_add:
       - SYS_ADMIN
